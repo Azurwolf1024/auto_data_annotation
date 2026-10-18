@@ -18,6 +18,9 @@ OUTPUT_FORMATS = ("json", "csv", "yolo", "coco")
 YOLO_TASK_TYPES = ("box", "point")  # point 用 YOLO-pose 行格式
 COCO_TASK_TYPES = ("box", "point")
 
+# point 导出成框时的默认边长（像素）。零面积框没法训练，故默认给一个小方框
+DEFAULT_POINT_BOX_SIZE = 32.0
+
 
 def parse_targets(raw) -> List[str]:
     """把逗号分隔的字符串解析成标签列表，去空白、去重、保序。"""
@@ -50,6 +53,8 @@ class Config:
     workers: int = 1
     confidence_threshold: float = 0.3
     resume: bool = True
+    # point 导出 yolo/coco 时，把中心点膨胀成边长为该像素数的小正方形框；0 表示零面积
+    point_box_size: float = DEFAULT_POINT_BOX_SIZE
 
     # ------------------------------------------------------------------ #
     def validate(self) -> "Config":
@@ -98,6 +103,13 @@ class Config:
                 f"confidence_threshold 必须在 0~1 之间，当前为 {self.confidence_threshold}"
             )
 
+        try:
+            self.point_box_size = float(self.point_box_size)
+        except (TypeError, ValueError):
+            raise ValueError(f"point_box_size 必须是数字，当前为 {self.point_box_size!r}")
+        if self.point_box_size < 0:
+            raise ValueError(f"point_box_size 不能为负，当前为 {self.point_box_size}")
+
         # 规范化
         self.targets = parse_targets(self.targets)
         self.task_type = self.task_type.strip().lower()
@@ -124,6 +136,11 @@ class Config:
             workers=int(getattr(args, "workers", 1) or 1),
             confidence_threshold=float(conf) if conf is not None else 0.3,
             resume=not bool(getattr(args, "no_resume", False)),
+            point_box_size=(
+                getattr(args, "point_box_size", None)
+                if getattr(args, "point_box_size", None) is not None
+                else DEFAULT_POINT_BOX_SIZE
+            ),
         )
 
     # ------------------------------------------------------------------ #
@@ -144,5 +161,6 @@ __all__ = [
     "OUTPUT_FORMATS",
     "YOLO_TASK_TYPES",
     "COCO_TASK_TYPES",
+    "DEFAULT_POINT_BOX_SIZE",
     "parse_targets",
 ]

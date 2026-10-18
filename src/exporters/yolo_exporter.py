@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from typing import List, Tuple
 
+from . import point_box_norm, read_image_size
 from ..config import YOLO_TASK_TYPES, Config
 
 # YOLO keypoint 可见性标志：0 未标注 / 1 标注但不可见 / 2 标注且可见
@@ -56,21 +57,41 @@ def to_yolo_line(obj: dict, targets: List[str]) -> str:
     )
 
 
-def to_yolo_pose_line(point: dict, targets: List[str]) -> str:
+def to_yolo_pose_line(
+    point: dict,
+    targets: List[str],
+    box_size_px: float = 0.0,
+    image_size: Tuple[int, int] = (0, 0),
+) -> str:
     """把一个物体中心点转成 YOLO-pose 格式行（point 任务）。
 
     格式：class cx cy w h kp_x kp_y kp_flag
-    point 只标中心点，因此 cx/cy 与 kp 相同，w/h 为 0，可见性固定 2。
+
+    零面积框无法训练，因此默认会把中心点膨胀成一个小正方形框
+    （边长 box_size_px 像素，默认 32；传 0 则退回零面积）。
+    kp_x/kp_y 始终保留模型给出的原始中心点，可见性固定 2。
     """
     class_index = _class_index(point.get("label", ""), targets)
 
     x = float(point.get("x", 0.0))
     y = float(point.get("y", 0.0))
+    cx, cy, w_norm, h_norm = point_box_norm(
+        x, y, image_size[0], image_size[1], box_size_px
+    )
 
     return (
-        f"{class_index} {_fmt(x)} {_fmt(y)} {_fmt(0.0)} {_fmt(0.0)} "
+        f"{class_index} {_fmt(cx)} {_fmt(cy)} {_fmt(w_norm)} {_fmt(h_norm)} "
         f"{_fmt(x)} {_fmt(y)} {KP_VISIBLE}"
     )
+
+
+def _image_size_of(image_path: str) -> Tuple[int, int]:
+    """读取图片宽高，失败返回 (0, 0)（交给 point_box_norm 兜底）。"""
+    try:
+        width, height = read_image_size(image_path)
+        return int(width), int(height)
+    except Exception:  # noqa: BLE001
+        return 0, 0
 
 
 def _lines_of(item, config: Config) -> List[str]:
@@ -81,8 +102,12 @@ def _lines_of(item, config: Config) -> List[str]:
             to_yolo_line(obj, config.targets) for obj in data.get("objects", [])
         ]
     if config.task_type == "point":
+        box_size = getattr(config, "point_box_size", 0.0)
+        image_size = (
+            _image_size_of(item.image_path) if box_size > 0 else (0, 0)
+        )
         return [
-            to_yolo_pose_line(point, config.targets)
+            to_yolo_pose_line(point, config.targets, box_size, image_size)
             for point in data.get("points", [])
         ]
     raise ValueError(

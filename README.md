@@ -8,6 +8,7 @@
 - **4 种输出**：`json`（每图一个）/ `csv`（整批汇总）/ `yolo`（box、point）/ `coco`（box、point）
 - **结构化保证**：用 Ollama `format` 参数传 JSON Schema 强制输出；解析失败自动重试 2 次（共 3 次），仍失败则跳过并记日志
 - **坐标归一化**：全部坐标统一到 0~1；模型若返回像素值会自动按图片宽高归一化
+- **point 可训练**：point 导出 YOLO/COCO 时自动把中心点膨胀成小方框（默认 32px），避免零面积框无法训练
 - **断点续跑**：中途中断再跑一次即可继续，已完成的图片不会重复调用模型
 - **并发预留**：`--workers N` 用 `ThreadPoolExecutor` 并发（默认 1，串行）
 
@@ -79,12 +80,17 @@ python main.py --task-type point --targets "圆形,正方形,三角形" --image-
 python main.py --task-type point --targets "圆形,正方形,三角形" --image-dir images --output-dir out_point_coco --output-format coco
 ```
 
-`out_point_yolo/labels/shapes.txt`（每行 `class cx cy w h kp_x kp_y kp_flag`，point 只有中心点故 `w=h=0`、`kp_flag=2`）：
+`out_point_yolo/labels/shapes.txt`（每行 `class cx cy w h kp_x kp_y kp_flag`，`kp_flag=2`）：
 
 ```
-0 0.406250 0.562500 0.000000 0.000000 0.406250 0.562500 2
-1 0.906250 0.562500 0.000000 0.000000 0.906250 0.562500 2
+0 0.406250 0.562500 0.050000 0.066667 0.406250 0.562500 2
+1 0.906250 0.562500 0.050000 0.066667 0.906250 0.562500 2
 ```
+
+> **为什么 w/h 不是 0**：零面积框在 YOLO 里学不到东西，因此 point 默认会把中心点
+> **膨胀成边长 32 像素的正方形框**（640×480 图上即 `0.05 × 0.0667`）。
+> `kp_x/kp_y` 始终是模型给出的原始中心点；靠边的点会把框向内收，保证框完整落在图内。
+> 想改大小用 `--point-box-size`，传 `0` 则退回零面积框。COCO 的 `bbox`/`area` 同样按此规则生成。
 
 ### 3. ocr —— 文字识别（不使用 targets）
 
@@ -123,6 +129,7 @@ python main.py --task-type tag --targets "室内,室外,几何,文字,简约,彩
 | `--ollama-url` | 否 | `http://localhost:11434` | Ollama 服务地址 |
 | `--workers` | 否 | `1` | 并发线程数，>1 时用 ThreadPoolExecutor |
 | `--confidence` | 否 | `0.3` | 置信度阈值，低于该值的项被丢弃（ocr 不过滤） |
+| `--point-box-size` | 否 | `32` | point 导出 yolo/coco 时中心点膨胀成的方框边长（像素），`0` = 零面积框 |
 | `--no-resume` | 否 | 关闭 | 关闭断点续跑，强制重跑全部图片 |
 
 ## 格式与任务兼容性
@@ -151,7 +158,7 @@ YOLO 行格式（全部为归一化值，6 位小数）：
 | task_type | 行格式 |
 | --- | --- |
 | box | `class_index x_center y_center width height` |
-| point | `class_index x_center y_center width height kp_x kp_y kp_flag`（YOLO-pose；`w=h=0`，`kp_x=kp_y=中心点`，`kp_flag=2`） |
+| point | `class_index x_center y_center width height kp_x kp_y kp_flag`（YOLO-pose；`w/h` 为中心点膨胀框，默认 32px，`kp_x/kp_y` 为原始中心点，`kp_flag=2`） |
 
 CSV 列定义：
 
@@ -228,6 +235,9 @@ A：YOLO 标签只有 bbox 与 pose 两种表达，`ocr` / `caption` / `tag` 请
 
 **Q：坐标看起来不对**
 A：代码会自动把 >1 的像素坐标按图片宽高归一化，并裁剪到 [0,1]；若仍异常，说明模型输出的框本身有偏差，可降低 `--confidence` 或换模型。
+
+**Q：point 导出的框太大/太小**
+A：默认 32 像素边长，用 `--point-box-size` 调；传 `0` 得到零面积框（仅 pose 关键点，不能用于检测训练）。
 
 **Q：COCO 里 width/height 是 0**
 A：图片尺寸由纯 Python 解析文件头获得，极少数损坏/特殊编码图片会解析失败；安装 Pillow 后会自动回退读取。

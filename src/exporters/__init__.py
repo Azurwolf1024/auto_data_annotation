@@ -111,6 +111,56 @@ def read_image_size(path: str) -> Tuple[int, int]:
 
 
 # --------------------------------------------------------------------------- #
+# point -> 小方框（零面积框没法训练，需要把中心点膨胀成正方形框）
+# --------------------------------------------------------------------------- #
+DEFAULT_POINT_FALLBACK_NORM = 0.02  # 取不到图片尺寸时，按图片短边的 2% 兜底
+
+
+def point_box_norm(
+    x: float,
+    y: float,
+    width: int,
+    height: int,
+    box_size_px: float,
+) -> Tuple[float, float, float, float]:
+    """把物体中心点膨胀成一个小正方形框。
+
+    参数
+    ----
+    x, y : 归一化中心点坐标（0~1）
+    width, height : 图片真实像素宽高（未知传 0）
+    box_size_px : 方框边长（像素）；<=0 表示不膨胀，返回零面积框
+
+    返回
+    ----
+    (cx, cy, w_norm, h_norm)：框中心与归一化宽高，框会向内收敛以保证完整落在图内
+    """
+    x = min(max(float(x), 0.0), 1.0)
+    y = min(max(float(y), 0.0), 1.0)
+    box_size_px = float(box_size_px or 0.0)
+
+    if box_size_px <= 0.0:
+        return x, y, 0.0, 0.0
+
+    if width > 0 and height > 0:
+        w_norm = box_size_px / float(width)
+        h_norm = box_size_px / float(height)
+    else:
+        # 取不到图片尺寸时的兜底：按归一化边长理解（<1 视为归一化，否则取默认比例）
+        w_norm = h_norm = (
+            box_size_px if 0.0 < box_size_px < 1.0 else DEFAULT_POINT_FALLBACK_NORM
+        )
+
+    w_norm = min(w_norm, 1.0)
+    h_norm = min(h_norm, 1.0)
+
+    # 让方框完整落在图片内（必要时微调中心，关键点坐标仍保持模型原值）
+    cx = min(max(x, w_norm / 2.0), 1.0 - w_norm / 2.0)
+    cy = min(max(y, h_norm / 2.0), 1.0 - h_norm / 2.0)
+    return cx, cy, w_norm, h_norm
+
+
+# --------------------------------------------------------------------------- #
 # 断点续跑状态
 # --------------------------------------------------------------------------- #
 def load_processed(output_dir: str) -> set:
@@ -206,6 +256,7 @@ __all__ = [
     "export_yolo",
     "export_coco",
     "read_image_size",
+    "point_box_norm",
     "relative_name",
     "load_processed",
     "save_processed",

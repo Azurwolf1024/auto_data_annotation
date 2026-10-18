@@ -15,7 +15,13 @@ from pathlib import Path
 # 允许直接 `python main.py` 运行（无需安装成包）
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.config import DEFAULT_MODEL, OUTPUT_FORMATS, TASK_TYPES, Config  # noqa: E402
+from src.config import (  # noqa: E402
+    DEFAULT_MODEL,
+    DEFAULT_POINT_BOX_SIZE,
+    OUTPUT_FORMATS,
+    TASK_TYPES,
+    Config,
+)
 from src.exporters import export  # noqa: E402
 from src.pipeline import run  # noqa: E402
 
@@ -56,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=1, help="并发线程数，默认 1（串行）")
     parser.add_argument(
         "--confidence", type=float, default=0.3, help="置信度阈值，低于该值的结果被丢弃"
+    )
+    parser.add_argument(
+        "--point-box-size",
+        type=float,
+        default=None,
+        help=(
+            f"point 任务导出 yolo/coco 时，把中心点膨胀成的方框边长（像素，默认 "
+            f"{DEFAULT_POINT_BOX_SIZE:g}）；传 0 表示保持零面积框"
+        ),
     )
     parser.add_argument(
         "--no-resume",

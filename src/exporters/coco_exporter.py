@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-from . import read_image_size, relative_name, save_processed
+from . import point_box_norm, read_image_size, relative_name, save_processed
 from ..config import COCO_TASK_TYPES, Config
 
 COCO_NAME = "annotations.json"
@@ -92,12 +92,25 @@ def _build_annotations(results, config: Config, sizes, image_id_of, start_id: in
                 ann_id += 1
 
         elif config.task_type == "point":
+            box_size = getattr(config, "point_box_size", 0.0)
             for point in data.get("points", []):
                 category_id = category_of.get(point.get("label"))
                 if category_id is None:
                     continue
                 x = float(point.get("x", 0.0)) * width
                 y = float(point.get("y", 0.0)) * height
+                # 零面积 bbox 无法训练，按 point_box_size 膨胀成小方框
+                cx_norm, cy_norm, w_norm, h_norm = point_box_norm(
+                    float(point.get("x", 0.0)),
+                    float(point.get("y", 0.0)),
+                    width,
+                    height,
+                    box_size,
+                )
+                box_w = w_norm * width
+                box_h = h_norm * height
+                box_x = (cx_norm - w_norm / 2.0) * width
+                box_y = (cy_norm - h_norm / 2.0) * height
                 annotations.append(
                     {
                         "id": ann_id,
@@ -105,8 +118,13 @@ def _build_annotations(results, config: Config, sizes, image_id_of, start_id: in
                         "category_id": category_id,
                         "keypoints": [round(x, 2), round(y, 2), 2],
                         "num_keypoints": 1,
-                        "bbox": [round(x, 2), round(y, 2), 0.0, 0.0],
-                        "area": 0.0,
+                        "bbox": [
+                            round(box_x, 2),
+                            round(box_y, 2),
+                            round(box_w, 2),
+                            round(box_h, 2),
+                        ],
+                        "area": round(box_w * box_h, 2),
                         "iscrowd": 0,
                         "score": float(point.get("confidence", 0.0)),
                     }
