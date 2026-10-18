@@ -5,7 +5,7 @@
 ## 特性
 
 - **5 种任务**：`box` 检测框 / `point` 物体中心点 / `ocr` 文字识别 / `caption` 图像描述 / `tag` 多标签
-- **4 种输出**：`json`（每图一个）/ `csv`（整批汇总）/ `yolo`（仅 box）/ `coco`（box、point）
+- **4 种输出**：`json`（每图一个）/ `csv`（整批汇总）/ `yolo`（box、point）/ `coco`（box、point）
 - **结构化保证**：用 Ollama `format` 参数传 JSON Schema 强制输出；解析失败自动重试 2 次（共 3 次），仍失败则跳过并记日志
 - **坐标归一化**：全部坐标统一到 0~1；模型若返回像素值会自动按图片宽高归一化
 - **断点续跑**：中途中断再跑一次即可继续，已完成的图片不会重复调用模型
@@ -72,6 +72,20 @@ python main.py --task-type point --targets "圆形,正方形,三角形" \
   --image-dir images --output-dir out_point --output-format json --model qwen3.5:4b
 ```
 
+point 同样支持 YOLO（pose 格式）与 COCO（keypoints）：
+
+```bash
+python main.py --task-type point --targets "圆形,正方形,三角形" --image-dir images --output-dir out_point_yolo --output-format yolo
+python main.py --task-type point --targets "圆形,正方形,三角形" --image-dir images --output-dir out_point_coco --output-format coco
+```
+
+`out_point_yolo/labels/shapes.txt`（每行 `class cx cy w h kp_x kp_y kp_flag`，point 只有中心点故 `w=h=0`、`kp_flag=2`）：
+
+```
+0 0.406250 0.562500 0.000000 0.000000 0.406250 0.562500 2
+1 0.906250 0.562500 0.000000 0.000000 0.906250 0.562500 2
+```
+
 ### 3. ocr —— 文字识别（不使用 targets）
 
 ```bash
@@ -117,7 +131,7 @@ python main.py --task-type tag --targets "室内,室外,几何,文字,简约,彩
 | --- | --- | :-: | :-: | :-: | :-: |
 | `json` | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `csv` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `yolo` | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `yolo` | ✓ | ✓ | ✗ | ✗ | ✗ |
 | `coco` | ✓ | ✓ | ✗ | ✗ | ✗ |
 
 不兼容的组合会在启动阶段直接抛 `ValueError` 并退出（退出码 2）。
@@ -131,6 +145,13 @@ yolo  -> output_dir/labels/<stem>.txt           每图一个
 csv   -> output_dir/annotations.csv             整批汇总（utf-8-sig）
 coco  -> output_dir/annotations.json            整批汇总（标准 COCO）
 ```
+
+YOLO 行格式（全部为归一化值，6 位小数）：
+
+| task_type | 行格式 |
+| --- | --- |
+| box | `class_index x_center y_center width height` |
+| point | `class_index x_center y_center width height kp_x kp_y kp_flag`（YOLO-pose；`w=h=0`，`kp_x=kp_y=中心点`，`kp_flag=2`） |
 
 CSV 列定义：
 
@@ -202,8 +223,8 @@ A：确认 Ollama 桌面端已启动，或用 `--ollama-url http://<host>:11434`
 **Q：模型返回的内容解析失败，日志出现「标注失败（已尝试 3 次）」**
 A：该图会被标记 `status="failed"` 并跳过，不影响其他图片。可换更大的视觉模型，或降低并发（`--workers 1`）后重试。
 
-**Q：`yolo 格式只支持 box 任务`**
-A：YOLO 标签只有 bbox 一种表达，请改用 `--output-format json`，或把任务改成 `box`。
+**Q：`yolo 格式只支持 ('box', 'point') 任务`**
+A：YOLO 标签只有 bbox 与 pose 两种表达，`ocr` / `caption` / `tag` 请改用 `--output-format json` 或 `csv`。
 
 **Q：坐标看起来不对**
 A：代码会自动把 >1 的像素坐标按图片宽高归一化，并裁剪到 [0,1]；若仍异常，说明模型输出的框本身有偏差，可降低 `--confidence` 或换模型。

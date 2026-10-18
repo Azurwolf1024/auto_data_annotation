@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-format",
         default="json",
         choices=list(OUTPUT_FORMATS),
-        help="输出格式：json（每图一个）/ csv（整批汇总）/ yolo（仅 box）/ coco（box/point）",
+        help="输出格式：json（每图一个）/ csv（整批汇总）/ yolo（box、point）/ coco（box、point）",
     )
     parser.add_argument(
         "--model",

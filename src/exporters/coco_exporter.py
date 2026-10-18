@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 from . import read_image_size, relative_name, save_processed
-from ..config import Config
+from ..config import COCO_TASK_TYPES, Config
 
 COCO_NAME = "annotations.json"
 
@@ -118,9 +118,9 @@ def _build_annotations(results, config: Config, sizes, image_id_of, start_id: in
 
 def export_coco(results, config: Config) -> str:
     """写出/合并 annotations.json，返回文件路径。"""
-    if config.task_type not in ("box", "point"):
+    if config.task_type not in COCO_TASK_TYPES:
         raise ValueError(
-            f"coco 格式只支持 box / point 任务，当前 task_type={config.task_type!r}"
+            f"coco 格式只支持 {COCO_TASK_TYPES} 任务，当前 task_type={config.task_type!r}"
         )
 
     os.makedirs(config.output_dir, exist_ok=True)

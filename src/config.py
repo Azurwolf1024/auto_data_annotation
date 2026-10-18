@@ -14,6 +14,10 @@ DEFAULT_MODEL = "qwen3.5:4b"
 TASK_TYPES = ("box", "point", "ocr", "caption", "tag")
 OUTPUT_FORMATS = ("json", "csv", "yolo", "coco")
 
+# 各输出格式支持的 task_type
+YOLO_TASK_TYPES = ("box", "point")  # point 用 YOLO-pose 行格式
+COCO_TASK_TYPES = ("box", "point")
+
 
 def parse_targets(raw) -> List[str]:
     """把逗号分隔的字符串解析成标签列表，去空白、去重、保序。"""
@@ -61,14 +65,14 @@ class Config:
             )
 
         # 格式与任务类型的兼容性
-        if self.output_format == "yolo" and self.task_type != "box":
+        if self.output_format == "yolo" and self.task_type not in YOLO_TASK_TYPES:
             raise ValueError(
-                f"yolo 格式只支持 box 任务，当前 task_type={self.task_type!r}"
+                f"yolo 格式只支持 {YOLO_TASK_TYPES} 任务，当前 task_type={self.task_type!r}"
             )
 
-        if self.output_format == "coco" and self.task_type in ("ocr", "caption", "tag"):
+        if self.output_format == "coco" and self.task_type not in COCO_TASK_TYPES:
             raise ValueError(
-                f"coco 格式只支持 box / point 任务，当前 task_type={self.task_type!r}"
+                f"coco 格式只支持 {COCO_TASK_TYPES} 任务，当前 task_type={self.task_type!r}"
             )
 
         # box / point 是 closed-set，必须有候选标签
@@ -138,5 +142,7 @@ __all__ = [
     "DEFAULT_MODEL",
     "TASK_TYPES",
     "OUTPUT_FORMATS",
+    "YOLO_TASK_TYPES",
+    "COCO_TASK_TYPES",
     "parse_targets",
 ]
