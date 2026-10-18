@@ -218,3 +218,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- 本项目自定义 ----
+
+# WorkBuddy 项目数据
+.workbuddy/
+
+# 运行时产物（标注输出，不入库）
+out/
+out_*/
+annotations.csv
+annotations.json
+processed.json
+labels/
+classes.txt
+
+# 数据目录（图片默认不入库，如需示例图用 git add -f）
+images/
+*.jpg
+*.jpeg
+*.png
+*.webp
