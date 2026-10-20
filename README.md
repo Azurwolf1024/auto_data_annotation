@@ -11,6 +11,7 @@
 - **point 可训练**：point 导出 YOLO/COCO 时自动把中心点膨胀成小方框（默认 32px），避免零面积框无法训练
 - **断点续跑**：中途中断再跑一次即可继续，已完成的图片不会重复调用模型
 - **二次验证（harness loop）**：`--verify` 开启后，box/point 检测出的每个候选会单独裁切出来再问一次模型「这里真有目标本体吗」，可挡掉 HUD / 文字横幅 / 武器视图等误检，并回贴修正框
+- **放大精修（MCP 裁剪放大服务）**：`--zoom-on-uncertain` 开启后，置信度低于阈值的 box/point 候选会被裁切并放大，重新标注后把坐标映射回原图；支持**多级（递归）放大**。放大能力来自一个零依赖的轻量 MCP 服务器（`mcp_server/crop_zoom_server.py`），可被任意 MCP 宿主复用
 - **并发预留**：`--workers N` 用 `ThreadPoolExecutor` 并发（默认 1，串行）
 
 ## 安装
@@ -143,6 +144,68 @@ python main.py --task-type point --targets "红色圆形,蓝色方块" \
 > **提示**：二次验证对每张候选多调用一次模型，会显著增加耗时与 token 消耗；
 > 对误检不敏感的场景可不开。仅 box / point 支持，其他任务类型组合会直接报错退出。
 
+### 7. 放大精修（MCP 裁剪放大服务，`--zoom-on-uncertain`）
+
+小模型对远处/细小的目标经常「看不准」——框偏了、置信度低。开启
+`--zoom-on-uncertain` 后，流水线会对**置信度低于 `--zoom-threshold` 的候选**
+做如下处理，直到置信度达标或达到 `--zoom-max-levels` 级：
+
+1. 以该候选框（或点周围区域）为局部矩形，调用 **MCP 裁剪放大服务** 裁切并放大，
+   得到一张更大的局部图；
+2. 把局部图重新喂给检测模型，筛出同类目标；
+3. 若仍低于阈值且未达最大级数，以检测到的框为新的局部矩形**继续放大更深一层**
+   （坐标随每一级 `region` 一路 compose 回原图）；
+4. 命中后，用最终的 `region` 把局部坐标**映射回原图坐标**，替换原始候选。
+
+每级的裁切图都会存到 `output_dir/_zoom/<stem>/`，方便你回看放大的过程。
+
+```bash
+# 对低置信度候选自动放大精修（默认放大 2 倍、最多 2 级、阈值 0.3）
+python main.py --task-type box --targets "圆形,正方形,三角形" \
+  --image-dir images --output-dir out_zoom --output-format json \
+  --zoom-on-uncertain --zoom-upscale 3 --zoom-max-levels 3 --zoom-threshold 0.5
+
+# 关闭 MCP 子进程、改用进程内本地引擎（更快，无 stdio 握手）
+python main.py ... --zoom-on-uncertain --no-zoom-mcp
+```
+
+> **与 `--verify` 的区别**：`--verify` 是「判断是否误检并剔除/修正」，放大精修是
+> 「看得不够清就放大重看、提升定位精度」。两者可叠加使用（先 verify 剔除误检，
+> 再对保留的低置信度候选放大精修）。
+
+#### 独立运行 MCP 服务器
+
+`mcp_server/crop_zoom_server.py` 是一个**零额外依赖**的轻量 MCP 服务
+（仅用标准库，通过 stdio 通信），可被任意 MCP 宿主（如 Claude Desktop）直接挂接：
+
+```bash
+python -m mcp_server.crop_zoom_server
+# 或
+python mcp_server/crop_zoom_server.py
+```
+
+它暴露的工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `crop_and_upscale` | 把图片某归一化区域裁切并放大，返回裁切图路径与 compose 后的原图矩形 `region` |
+| `map_box_to_original` | 把相对某裁切图的归一化框映射回原图坐标 |
+| `map_point_to_original` | 把相对某裁切图的点映射回原图坐标 |
+| `health` | 健康检查 |
+
+典型多级放大调用序列（以原图 `region={0,0,1,1}` 为例）：
+
+```
+# 第 1 级：在原图里裁切 (0.2,0.2)-(0.6,0.6) 放大 2 倍
+crop_and_upscale(image, {0,0,1,1}, [0.2,0.2,0.6,0.6], 2)
+  -> {cropped_image_path, region: {0.2,0.2,0.6,0.6}, size:[...]}
+# 第 2 级：在上一级裁切图里再裁切 (0.3,0.3)-(0.7,0.7) 放大 2 倍
+crop_and_upscale(crop1, {0.2,0.2,0.6,0.6}, [0.3,0.3,0.7,0.7], 2)
+  -> region: {0.32,0.32,0.44,0.44}   # 已 compose 回原图
+# 把局部检测框映射回原图
+map_box_to_original({0.32,0.32,0.44,0.44}, [lx,ly,rx,ry]) -> 原图坐标
+```
+
 ## 参数表
 
 | 参数 | 必填 | 默认值 | 说明 |
@@ -163,6 +226,13 @@ python main.py --task-type point --targets "红色圆形,蓝色方块" \
 | `--verify-margin` | 否 | `0.25` | 验证时向外扩边比例（相对框尺寸）；point 任务视为裁切半边长（归一化） |
 | `--verify-threshold` | 否 | `0.5` | 复核置信度阈值，低于则剔除该候选 |
 | `--verify-domain-hints` | 否 | 空 | 领域线索写入验证 prompt（如「游戏截图」「医学影像」），帮助模型识别误检 |
+| `--zoom-on-uncertain` | 否 | 关闭 | 开启放大精修：box/point 中置信度低于阈值的候选，自动裁切放大后重新标注并映射回原图 |
+| `--zoom-upscale` | 否 | `2` | 放大倍数（像素维度） |
+| `--zoom-threshold` | 否 | `0.3` | 触发放大的置信度阈值，低于则放大精修 |
+| `--zoom-max-levels` | 否 | `2` | 最大放大级数（支持多级/递归放大） |
+| `--zoom-margin` | 否 | `0.25` | point 任务每次放大的裁切半边长（归一化） |
+| `--no-zoom-mcp` | 否 | 关闭 | 关闭通过 MCP 服务调用放大，改用进程内本地引擎（无子进程） |
+| `--zoom-server` | 否 | 自动 | MCP 服务器脚本路径，默认 `mcp_server/crop_zoom_server.py` |
 
 ## 格式与任务兼容性
 
@@ -184,9 +254,10 @@ yolo  -> output_dir/labels/<stem>.txt           每图一个
 csv   -> output_dir/annotations.csv             整批汇总（utf-8-sig）
 coco  -> output_dir/annotations.json            整批汇总（标准 COCO）
 _verify -> output_dir/_verify/<stem>/candNN_rR.png  仅 --verify 时生成，每张候选的复核裁切图（供人工回看）
+_zoom   -> output_dir/_zoom/<stem>/candNN_Lk.png    仅 --zoom-on-uncertain 时生成，每张低置信度候选的逐级放大裁切图
 ```
 
-> `_verify/` 是中间产物，仅供你肉眼复核「模型究竟看到了什么」，可随时删除，不影响最终标注。
+> `_verify/` 与 `_zoom/` 都是中间产物，仅供你肉眼复核「模型究竟看到了什么 / 放大到了什么」，可随时删除，不影响最终标注。
 
 YOLO 行格式（全部为归一化值，6 位小数）：
 
@@ -212,6 +283,9 @@ auto-annotator/
 ├── requirements.txt
 ├── README.md
 ├── main.py                 薄 CLI 封装
+├── mcp_server/
+│   ├── __init__.py
+│   └── crop_zoom_server.py 轻量 MCP 服务（裁剪/放大 + 坐标映射，零额外依赖）
 └── src/
     ├── __init__.py         包出口：Config / run / export
     ├── config.py           Config 数据类与校验
@@ -219,7 +293,8 @@ auto-annotator/
     ├── prompts.py          五种中文 prompt
     ├── ollama_client.py    Ollama 调用 + JSON Schema + 重试
     ├── validator.py        结果清洗（闭集过滤、置信度、坐标裁剪）
-    ├── pipeline.py         扫描 / 续跑 / 并发 / 进度
+    ├── mcp_zoom.py         放大精修客户端（MCP stdio 客户端 / 本地引擎）
+    ├── pipeline.py         扫描 / 续跑 / 并发 / 进度 / 验证 / 放大精修
     └── exporters/
         ├── __init__.py     分发 + read_image_size + processed 状态
         ├── json_exporter.py
@@ -279,6 +354,18 @@ A：图片尺寸由纯 Python 解析文件头获得，极少数损坏/特殊编�
 
 **Q：`--verify 仅支持 box / point 任务`**
 A：二次验证是对检测候选做裁切复核，只有 box / point 有「候选位置」可裁切；ocr / caption / tag 请用不带 `--verify` 的普通流程。
+
+**Q：`--zoom-on-uncertain 仅支持 box / point 任务`**
+A：放大精修依赖候选的「位置」去裁切局部图，只有 box / point 有位置信息；ocr / caption / tag 暂不支持。
+
+**Q：开启 `--zoom-on-uncertain` 后输出目录多了 `_zoom/`**
+A：那是每张低置信度候选的逐级放大裁切图（供你回看放大到了什么），纯中间产物，可随时删除，不影响最终 `json` / `yolo` / `coco` 输出。
+
+**Q：放大精修没生效 / 没有候选被放大**
+A：只有置信度 `< --zoom-threshold` 的候选才会被放大；若模型给的置信度都很高则不会触发。可把 `--zoom-threshold` 调高（如 0.6）来覆盖更多候选。
+
+**Q：想把这个裁剪放大能力用在自己的 Agent / Claude Desktop 里**
+A：直接运行 `python -m mcp_server.crop_zoom_server`，它是一个零依赖的 MCP stdio 服务，暴露 `crop_and_upscale` / `map_box_to_original` / `map_point_to_original` / `health` 四个工具，可被任意 MCP 宿主挂接。
 
 **Q：开启 `--verify` 后输出目录多了 `_verify/`**
 A：那是每张候选的复核裁切图（供你回看模型看到了什么），纯中间产物，可随时删除，不影响最终 `json` / `yolo` / `coco` 输出。

@@ -106,6 +106,47 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="领域线索，写入验证 prompt（例如『游戏截图』『医学影像』），帮助模型识别误检",
     )
+    # ---- 放大精修（zoom-on-uncertain）----
+    parser.add_argument(
+        "--zoom-on-uncertain",
+        action="store_true",
+        help="开启放大精修：box/point 中置信度低于阈值的候选，自动裁切放大后重新标注并映射回原图",
+    )
+    parser.add_argument(
+        "--zoom-upscale",
+        type=int,
+        default=2,
+        help="放大倍数（像素维度），默认 2",
+    )
+    parser.add_argument(
+        "--zoom-threshold",
+        type=float,
+        default=None,
+        help="触发放大的置信度阈值，低于则放大精修，默认 0.3",
+    )
+    parser.add_argument(
+        "--zoom-max-levels",
+        type=int,
+        default=2,
+        help="最大放大级数（支持多级/递归放大），默认 2",
+    )
+    parser.add_argument(
+        "--zoom-margin",
+        type=float,
+        default=None,
+        help="point 任务每次放大的裁切半边长（归一化），默认 0.25",
+    )
+    parser.add_argument(
+        "--no-zoom-mcp",
+        dest="zoom_via_mcp",
+        action="store_false",
+        help="关闭通过 MCP 服务调用放大（改用进程内本地引擎，无子进程）",
+    )
+    parser.add_argument(
+        "--zoom-server",
+        default="",
+        help="MCP 服务器脚本路径；默认自动定位 mcp_server/crop_zoom_server.py",
+    )
     return parser
 
 

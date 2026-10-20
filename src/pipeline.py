@@ -17,9 +17,16 @@ from typing import Dict, List, Optional, Tuple
 
 from .config import Config
 from .exporters import load_processed, read_image_size, relative_name
+from .mcp_zoom import make_zoom_client
 from .ollama_client import annotate, build_client
 from .prompts import build_prompt, build_verify_prompt
-from .schema import SCHEMA_MAP, AnnotationResult, VerifyAnnotation
+from .schema import (
+    SCHEMA_MAP,
+    AnnotationResult,
+    BoxAnnotation,
+    PointAnnotation,
+    VerifyAnnotation,
+)
 from .validator import clean, _match_target, clamp
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -349,6 +356,205 @@ def harness_verify(
     return cleaned
 
 
+# --------------------------------------------------------------------------- #
+# 放大精修（zoom-on-uncertain）：模型不确定时放大、重新标注、映射回原图
+# --------------------------------------------------------------------------- #
+def _zoom_refine_boxes(
+    image_path: str,
+    objects: List[Dict[str, Any]],
+    config: Config,
+    zoom_client,
+) -> List[Dict[str, Any]]:
+    """对置信度低于阈值的 box 候选放大精修，支持多级（递归）放大。
+
+    流程（单候选）：
+    1. 以候选框为 local 子矩形，调用裁切放大服务得到裁切图 + 原图矩形 region；
+    2. 把裁切图再次喂给 box 检测模型，筛出同类目标；
+    3. 若置信度仍低于阈值且未达最大级数，以该检测框为新的 local、以上一级
+       region 为新 region，进入更深一层放大（坐标随 region 一路 compose 回原图）；
+    4. 命中或耗尽级数后，用最终的 region 把局部框映射回原图坐标，替换原候选。
+    """
+    targets = config.targets
+    stem = Path(image_path).stem
+    zoom_dir = Path(config.output_dir) / "_zoom" / stem
+    os.makedirs(zoom_dir, exist_ok=True)
+
+    refined: List[Dict[str, Any]] = []
+    for idx, obj in enumerate(objects, start=1):
+        if float(obj.get("confidence", 0.0)) >= config.zoom_threshold:
+            refined.append(obj)
+            continue
+
+        region = {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}
+        cur_image = image_path
+        local = (obj["x_min"], obj["y_min"], obj["x_max"], obj["y_max"])
+        best = None
+        best_region = region
+
+        for lvl in range(1, config.zoom_max_levels + 1):
+            try:
+                data = zoom_client.crop_and_upscale(
+                    cur_image, region, local, config.zoom_upscale, str(zoom_dir),
+                    tag=f"cand{idx}_L{lvl}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"    ✗ cand{idx} 第{lvl}级放大调用失败：{exc}", flush=True)
+                break
+            crop_path = data["cropped_image_path"]
+            composed = data["region"]
+            try:
+                raw = annotate(
+                    crop_path, build_prompt("box", targets), BoxAnnotation, config
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"    ✗ cand{idx} 第{lvl}级放大标注失败：{exc}", flush=True)
+                break
+
+            dets = clean(raw, "box", targets, 0.0).get("objects", [])
+            dets = [d for d in dets if d.get("label") == obj.get("label")]
+            if not dets:
+                print(f"    · cand{idx} 第{lvl}级放大未检出同类目标", flush=True)
+                break
+
+            cur = max(dets, key=lambda d: float(d.get("confidence", 0.0)))
+            best = cur
+            best_region = composed
+            if float(cur.get("confidence", 0.0)) >= config.zoom_threshold:
+                print(
+                    f"    ✓ cand{idx} 第{lvl}级放大后置信度提升至 "
+                    f"{cur['confidence']:.2f}",
+                    flush=True,
+                )
+                break
+            # 继续更深放大：以当前检测框为新的 local（相对本裁切图）
+            local = (cur["x_min"], cur["y_min"], cur["x_max"], cur["y_max"])
+            region = composed
+            cur_image = crop_path
+
+        if best is not None:
+            orig = zoom_client.map_box_to_original(
+                best_region, (best["x_min"], best["y_min"], best["x_max"], best["y_max"])
+            )
+            refined.append(
+                {
+                    "label": obj["label"],
+                    "confidence": round(float(best.get("confidence", obj.get("confidence", 0.0))), 4),
+                    "x_min": round(orig["x_min"], 6),
+                    "y_min": round(orig["y_min"], 6),
+                    "x_max": round(orig["x_max"], 6),
+                    "y_max": round(orig["y_max"], 6),
+                }
+            )
+        else:
+            refined.append(obj)
+
+    print(f"  放大精修：{len(refined)}/{len(objects)} 个框完成", flush=True)
+    return refined
+
+
+def _zoom_refine_points(
+    image_path: str,
+    points: List[Dict[str, Any]],
+    config: Config,
+    zoom_client,
+) -> List[Dict[str, Any]]:
+    """对置信度低于阈值的 point 候选放大精修（围绕点取方形区域裁切），支持多级。"""
+    targets = config.targets
+    stem = Path(image_path).stem
+    zoom_dir = Path(config.output_dir) / "_zoom" / stem
+    os.makedirs(zoom_dir, exist_ok=True)
+    m = config.zoom_margin
+
+    refined: List[Dict[str, Any]] = []
+    for idx, pt in enumerate(points, start=1):
+        if float(pt.get("confidence", 0.0)) >= config.zoom_threshold:
+            refined.append(pt)
+            continue
+
+        x = clamp(pt.get("x", 0.0))
+        y = clamp(pt.get("y", 0.0))
+        region = {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}
+        cur_image = image_path
+        local = (clamp(x - m), clamp(y - m), clamp(x + m), clamp(y + m))
+        best = None
+        best_region = region
+
+        for lvl in range(1, config.zoom_max_levels + 1):
+            try:
+                data = zoom_client.crop_and_upscale(
+                    cur_image, region, local, config.zoom_upscale, str(zoom_dir),
+                    tag=f"pt{idx}_L{lvl}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"    ✗ pt{idx} 第{lvl}级放大调用失败：{exc}", flush=True)
+                break
+            crop_path = data["cropped_image_path"]
+            composed = data["region"]
+            try:
+                raw = annotate(
+                    crop_path, build_prompt("point", targets), PointAnnotation, config
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"    ✗ pt{idx} 第{lvl}级放大标注失败：{exc}", flush=True)
+                break
+
+            dets = clean(raw, "point", targets, 0.0).get("points", [])
+            dets = [d for d in dets if d.get("label") == pt.get("label")]
+            if not dets:
+                print(f"    · pt{idx} 第{lvl}级放大未检出同类目标", flush=True)
+                break
+
+            cur = max(dets, key=lambda d: float(d.get("confidence", 0.0)))
+            best = cur
+            best_region = composed
+            if float(cur.get("confidence", 0.0)) >= config.zoom_threshold:
+                print(
+                    f"    ✓ pt{idx} 第{lvl}级放大后置信度提升至 "
+                    f"{cur['confidence']:.2f}",
+                    flush=True,
+                )
+                break
+            cx = clamp(cur.get("x", 0.0))
+            cy = clamp(cur.get("y", 0.0))
+            local = (clamp(cx - m), clamp(cy - m), clamp(cx + m), clamp(cy + m))
+            region = composed
+            cur_image = crop_path
+
+        if best is not None:
+            orig = zoom_client.map_point_to_original(best_region, best.get("x", 0.0), best.get("y", 0.0))
+            refined.append(
+                {
+                    "label": pt["label"],
+                    "confidence": round(float(best.get("confidence", pt.get("confidence", 0.0))), 4),
+                    "x": round(orig["x"], 6),
+                    "y": round(orig["y"], 6),
+                }
+            )
+        else:
+            refined.append(pt)
+
+    print(f"  放大精修：{len(refined)}/{len(points)} 个点完成", flush=True)
+    return refined
+
+
+def zoom_refine(
+    image_path: str,
+    cleaned: Dict[str, Any],
+    config: Config,
+    zoom_client,
+) -> Dict[str, Any]:
+    """放大精修入口，按任务类型分派到 box / point。"""
+    if config.task_type == "box":
+        cleaned["objects"] = _zoom_refine_boxes(
+            image_path, cleaned.get("objects", []), config, zoom_client
+        )
+    elif config.task_type == "point":
+        cleaned["points"] = _zoom_refine_points(
+            image_path, cleaned.get("points", []), config, zoom_client
+        )
+    return cleaned
+
+
 def _count_of(task_type: str, result: Dict) -> int:
     if task_type == "caption":
         return 1 if result.get("summary") else 0
@@ -363,9 +569,9 @@ def annotate_image(image: Path, config: Config) -> AnnotationResult:
     prompt = build_prompt(task_type, config.targets)
     schema_class = SCHEMA_MAP[task_type]
 
-    # 开启二次验证时，复用同一个 Ollama 客户端（检测 + 多轮复核）
+    # 开启二次验证或放大精修时，复用同一个 Ollama 客户端（检测 + 多轮调用）
     client = None
-    if config.verify and task_type in ("box", "point"):
+    if task_type in ("box", "point") and (config.verify or config.zoom_on_uncertain):
         try:
             client = build_client(getattr(config, "ollama_url", "http://localhost:11434"))
         except Exception:  # noqa: BLE001 - 建客户端失败则退回每次自建
@@ -415,6 +621,23 @@ def annotate_image(image: Path, config: Config) -> AnnotationResult:
             )
         else:
             print(f"  ⚠ {image.name} 无法读取图片尺寸，跳过二次验证", flush=True)
+
+    # 放大精修（zoom-on-uncertain）：低置信度候选放大后重新标注并映射回原图
+    if config.zoom_on_uncertain and task_type in ("box", "point"):
+        if pil_image is not None and image_size is not None:
+            try:
+                zoom_client = make_zoom_client(config)
+                cleaned = zoom_refine(
+                    image_path=str(image),
+                    cleaned=cleaned,
+                    config=config,
+                    zoom_client=zoom_client,
+                )
+                zoom_client.close()
+            except Exception as exc:  # noqa: BLE001 - 放大失败则保留原结果
+                print(f"  ⚠ {image.name} 放大精修失败，保留原结果：{exc}", flush=True)
+        else:
+            print(f"  ⚠ {image.name} 无法读取图片尺寸，跳过放大精修", flush=True)
 
     return AnnotationResult(
         task_type=task_type,
@@ -499,4 +722,14 @@ def run(config: Config) -> List[AnnotationResult]:
     return results
 
 
-__all__ = ["run", "annotate_image", "find_images", "harness_verify", "_verify_boxes", "_verify_points"]
+__all__ = [
+    "run",
+    "annotate_image",
+    "find_images",
+    "harness_verify",
+    "_verify_boxes",
+    "_verify_points",
+    "zoom_refine",
+    "_zoom_refine_boxes",
+    "_zoom_refine_points",
+]

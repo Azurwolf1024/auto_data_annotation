@@ -26,6 +26,12 @@ DEFAULT_VERIFY_ROUNDS = 1
 DEFAULT_VERIFY_MARGIN = 0.25
 DEFAULT_VERIFY_THRESHOLD = 0.5
 
+# 放大精修（zoom-on-uncertain）默认参数
+DEFAULT_ZOOM_UPSCALE = 2
+DEFAULT_ZOOM_THRESHOLD = 0.3
+DEFAULT_ZOOM_MAX_LEVELS = 2
+DEFAULT_ZOOM_MARGIN = 0.25
+
 
 def parse_targets(raw) -> List[str]:
     """把逗号分隔的字符串解析成标签列表，去空白、去重、保序。"""
@@ -66,6 +72,14 @@ class Config:
     verify_margin: float = DEFAULT_VERIFY_MARGIN
     verify_threshold: float = DEFAULT_VERIFY_THRESHOLD
     verify_domain_hints: str = ""
+    # 放大精修（zoom-on-uncertain）：低置信度候选放大后重新标注并映射回原图
+    zoom_on_uncertain: bool = False
+    zoom_upscale: int = DEFAULT_ZOOM_UPSCALE
+    zoom_threshold: float = DEFAULT_ZOOM_THRESHOLD
+    zoom_max_levels: int = DEFAULT_ZOOM_MAX_LEVELS
+    zoom_margin: float = DEFAULT_ZOOM_MARGIN
+    zoom_via_mcp: bool = True
+    zoom_server: str = ""
 
     # ------------------------------------------------------------------ #
     def validate(self) -> "Config":
@@ -151,6 +165,45 @@ class Config:
                     f"verify_threshold 必须在 0~1 之间，当前为 {self.verify_threshold}"
                 )
 
+        # 放大精修（zoom-on-uncertain）仅支持 box / point
+        if self.zoom_on_uncertain and self.task_type not in ("box", "point"):
+            raise ValueError(
+                f"--zoom-on-uncertain 仅支持 box / point 任务，当前 task_type={self.task_type!r}"
+            )
+
+        if self.zoom_on_uncertain:
+            try:
+                self.zoom_upscale = int(self.zoom_upscale)
+            except (TypeError, ValueError):
+                raise ValueError(f"zoom_upscale 必须是整数，当前为 {self.zoom_upscale!r}")
+            if self.zoom_upscale < 1:
+                raise ValueError(f"zoom_upscale 必须 >= 1，当前为 {self.zoom_upscale}")
+
+            try:
+                self.zoom_max_levels = int(self.zoom_max_levels)
+            except (TypeError, ValueError):
+                raise ValueError(f"zoom_max_levels 必须是整数，当前为 {self.zoom_max_levels!r}")
+            if self.zoom_max_levels < 1:
+                raise ValueError(f"zoom_max_levels 必须 >= 1，当前为 {self.zoom_max_levels}")
+
+            try:
+                self.zoom_margin = float(self.zoom_margin)
+            except (TypeError, ValueError):
+                raise ValueError(f"zoom_margin 必须是数字，当前为 {self.zoom_margin!r}")
+            if self.zoom_margin < 0:
+                raise ValueError(f"zoom_margin 不能为负，当前为 {self.zoom_margin}")
+
+            try:
+                self.zoom_threshold = float(self.zoom_threshold)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"zoom_threshold 必须是数字，当前为 {self.zoom_threshold!r}"
+                )
+            if not (0.0 <= self.zoom_threshold <= 1.0):
+                raise ValueError(
+                    f"zoom_threshold 必须在 0~1 之间，当前为 {self.zoom_threshold}"
+                )
+
         # 规范化
         self.targets = parse_targets(self.targets)
         self.task_type = self.task_type.strip().lower()
@@ -197,6 +250,25 @@ class Config:
                 else DEFAULT_VERIFY_THRESHOLD
             ),
             verify_domain_hints=str(getattr(args, "verify_domain_hints", "") or ""),
+            zoom_on_uncertain=bool(getattr(args, "zoom_on_uncertain", False)),
+            zoom_upscale=(
+                int(getattr(args, "zoom_upscale", DEFAULT_ZOOM_UPSCALE) or DEFAULT_ZOOM_UPSCALE)
+            ),
+            zoom_threshold=(
+                float(getattr(args, "zoom_threshold", DEFAULT_ZOOM_THRESHOLD))
+                if getattr(args, "zoom_threshold", None) is not None
+                else DEFAULT_ZOOM_THRESHOLD
+            ),
+            zoom_max_levels=(
+                int(getattr(args, "zoom_max_levels", DEFAULT_ZOOM_MAX_LEVELS) or DEFAULT_ZOOM_MAX_LEVELS)
+            ),
+            zoom_margin=(
+                float(getattr(args, "zoom_margin", DEFAULT_ZOOM_MARGIN))
+                if getattr(args, "zoom_margin", None) is not None
+                else DEFAULT_ZOOM_MARGIN
+            ),
+            zoom_via_mcp=bool(getattr(args, "zoom_via_mcp", True)),
+            zoom_server=str(getattr(args, "zoom_server", "") or ""),
         )
 
     # ------------------------------------------------------------------ #
@@ -213,6 +285,12 @@ class Config:
                 if self.verify
                 else ""
             )
+            + (
+                f" zoom=on up={self.zoom_upscale} thr={self.zoom_threshold} "
+                f"levels={self.zoom_max_levels} mcp={self.zoom_via_mcp}"
+                if self.zoom_on_uncertain
+                else ""
+            )
         )
 
 
@@ -227,5 +305,9 @@ __all__ = [
     "DEFAULT_VERIFY_ROUNDS",
     "DEFAULT_VERIFY_MARGIN",
     "DEFAULT_VERIFY_THRESHOLD",
+    "DEFAULT_ZOOM_UPSCALE",
+    "DEFAULT_ZOOM_THRESHOLD",
+    "DEFAULT_ZOOM_MAX_LEVELS",
+    "DEFAULT_ZOOM_MARGIN",
     "parse_targets",
 ]
