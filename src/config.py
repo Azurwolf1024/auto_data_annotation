@@ -21,6 +21,11 @@ COCO_TASK_TYPES = ("box", "point")
 # point 导出成框时的默认边长（像素）。零面积框没法训练，故默认给一个小方框
 DEFAULT_POINT_BOX_SIZE = 32.0
 
+# 二次验证（harness loop）默认参数
+DEFAULT_VERIFY_ROUNDS = 1
+DEFAULT_VERIFY_MARGIN = 0.25
+DEFAULT_VERIFY_THRESHOLD = 0.5
+
 
 def parse_targets(raw) -> List[str]:
     """把逗号分隔的字符串解析成标签列表，去空白、去重、保序。"""
@@ -55,6 +60,12 @@ class Config:
     resume: bool = True
     # point 导出 yolo/coco 时，把中心点膨胀成边长为该像素数的小正方形框；0 表示零面积
     point_box_size: float = DEFAULT_POINT_BOX_SIZE
+    # 二次验证（harness loop）：检测后再逐候选裁切复核，剔除误检
+    verify: bool = False
+    verify_rounds: int = DEFAULT_VERIFY_ROUNDS
+    verify_margin: float = DEFAULT_VERIFY_MARGIN
+    verify_threshold: float = DEFAULT_VERIFY_THRESHOLD
+    verify_domain_hints: str = ""
 
     # ------------------------------------------------------------------ #
     def validate(self) -> "Config":
@@ -110,6 +121,36 @@ class Config:
         if self.point_box_size < 0:
             raise ValueError(f"point_box_size 不能为负，当前为 {self.point_box_size}")
 
+        # 二次验证（harness loop）仅支持 box / point
+        if self.verify and self.task_type not in ("box", "point"):
+            raise ValueError(
+                f"--verify 仅支持 box / point 任务，当前 task_type={self.task_type!r}"
+            )
+
+        if self.verify:
+            try:
+                self.verify_rounds = int(self.verify_rounds)
+            except (TypeError, ValueError):
+                raise ValueError(f"verify_rounds 必须是正整数，当前为 {self.verify_rounds!r}")
+            if self.verify_rounds < 1:
+                raise ValueError(f"verify_rounds 必须 >= 1，当前为 {self.verify_rounds}")
+            try:
+                self.verify_margin = float(self.verify_margin)
+            except (TypeError, ValueError):
+                raise ValueError(f"verify_margin 必须是数字，当前为 {self.verify_margin!r}")
+            if self.verify_margin < 0:
+                raise ValueError(f"verify_margin 不能为负，当前为 {self.verify_margin}")
+            try:
+                self.verify_threshold = float(self.verify_threshold)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"verify_threshold 必须是数字，当前为 {self.verify_threshold!r}"
+                )
+            if not (0.0 <= self.verify_threshold <= 1.0):
+                raise ValueError(
+                    f"verify_threshold 必须在 0~1 之间，当前为 {self.verify_threshold}"
+                )
+
         # 规范化
         self.targets = parse_targets(self.targets)
         self.task_type = self.task_type.strip().lower()
@@ -141,6 +182,21 @@ class Config:
                 if getattr(args, "point_box_size", None) is not None
                 else DEFAULT_POINT_BOX_SIZE
             ),
+            verify=bool(getattr(args, "verify", False)),
+            verify_rounds=(
+                int(getattr(args, "verify_rounds", DEFAULT_VERIFY_ROUNDS) or DEFAULT_VERIFY_ROUNDS)
+            ),
+            verify_margin=(
+                float(getattr(args, "verify_margin", DEFAULT_VERIFY_MARGIN))
+                if getattr(args, "verify_margin", None) is not None
+                else DEFAULT_VERIFY_MARGIN
+            ),
+            verify_threshold=(
+                float(getattr(args, "verify_threshold", DEFAULT_VERIFY_THRESHOLD))
+                if getattr(args, "verify_threshold", None) is not None
+                else DEFAULT_VERIFY_THRESHOLD
+            ),
+            verify_domain_hints=str(getattr(args, "verify_domain_hints", "") or ""),
         )
 
     # ------------------------------------------------------------------ #
@@ -151,6 +207,12 @@ class Config:
             f"model={self.model_name} targets={self.targets or '-'} "
             f"workers={self.workers} conf>={self.confidence_threshold} "
             f"resume={self.resume}"
+            + (
+                f" verify=on rounds={self.verify_rounds} margin={self.verify_margin} "
+                f"thr={self.verify_threshold}"
+                if self.verify
+                else ""
+            )
         )
 
 
@@ -162,5 +224,8 @@ __all__ = [
     "YOLO_TASK_TYPES",
     "COCO_TASK_TYPES",
     "DEFAULT_POINT_BOX_SIZE",
+    "DEFAULT_VERIFY_ROUNDS",
+    "DEFAULT_VERIFY_MARGIN",
+    "DEFAULT_VERIFY_THRESHOLD",
     "parse_targets",
 ]

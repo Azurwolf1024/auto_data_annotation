@@ -1,3 +1,4 @@
 ollama
 pydantic>=2.0
 pyyaml
+pillow

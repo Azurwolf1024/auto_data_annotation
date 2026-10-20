@@ -134,4 +134,40 @@ def build_prompt(task_type: str, targets: List[str] = None) -> str:
     )
 
 
-__all__ = ["build_prompt"]
+def build_verify_prompt(targets: List[str] = None, domain_hints: str = "") -> str:
+    """构造二次验证（harness loop）用的中文 prompt。
+
+    输入是一张**从原图裁切出来的子图**，要求模型判断其中是否真的存在
+    完整、可见的目标本体；若是，则给出紧贴该目标的修正框（相对本张裁切图
+    归一化）。重点在于挡掉 HUD / 光效 / 文字横幅 / 武器视图等误检。
+    """
+    targets = list(targets or [])
+    hints_block = (
+        f"\n附加领域线索：{domain_hints}\n"
+        "结合上述线索判断哪些才算真实目标本体。\n"
+        if domain_hints
+        else ""
+    )
+    return (
+        "你正在复核一张从原图中裁切出来的子图，子图里应当包含一个候选目标。\n"
+        f"候选标签列表：{_format_targets(targets)}\n"
+        "请判断：这张裁切图里是否真的存在一个完整、可见的目标本体？\n"
+        "规则：\n"
+        "1. 必须是真实可见的目标本体（例如人物需要头+身体都可见，车辆是整车可见部分）；\n"
+        "2. 不要被游戏 / 界面里的 HUD、光效、文字横幅、武器视图、血条、击杀提示、"
+        "飘字等误导；如果裁切里只有这些非本体元素，或目标只是被遮挡的零星碎片，"
+        "则必须置 present=false；\n"
+        "3. 只有当确认存在候选列表中的真实目标时，才置 present=true，"
+        "并给出紧贴该目标边缘的修正框（相对【本张裁切图】归一化到 0~1）；\n"
+        "4. label 必须是候选列表中的类别，无目标时置空串；\n"
+        f"5. {NORM_HINT}\n"
+        f"{hints_block}"
+        f"{NO_EXPLAIN}\n"
+        '输出格式：{"present": true, "label": "类别", "confidence": 0.9, '
+        '"x_min": 0.1, "y_min": 0.2, "x_max": 0.8, "y_max": 0.9}。\n'
+        '如果没有真实目标本体，输出 {"present": false, "label": "", "confidence": 0.0, '
+        '"x_min": 0.0, "y_min": 0.0, "x_max": 0.0, "y_max": 0.0}。'
+    )
+
+
+__all__ = ["build_prompt", "build_verify_prompt"]

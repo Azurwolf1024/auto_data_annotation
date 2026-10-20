@@ -10,6 +10,7 @@
 - **坐标归一化**：全部坐标统一到 0~1；模型若返回像素值会自动按图片宽高归一化
 - **point 可训练**：point 导出 YOLO/COCO 时自动把中心点膨胀成小方框（默认 32px），避免零面积框无法训练
 - **断点续跑**：中途中断再跑一次即可继续，已完成的图片不会重复调用模型
+- **二次验证（harness loop）**：`--verify` 开启后，box/point 检测出的每个候选会单独裁切出来再问一次模型「这里真有目标本体吗」，可挡掉 HUD / 文字横幅 / 武器视图等误检，并回贴修正框
 - **并发预留**：`--workers N` 用 `ThreadPoolExecutor` 并发（默认 1，串行）
 
 ## 安装
@@ -116,6 +117,32 @@ python main.py --task-type tag --targets "室内,室外,几何,文字,简约,彩
   --image-dir images --output-dir out_tag --output-format json
 ```
 
+### 6. 二次验证（harness loop，`--verify`）
+
+box / point 检测经常把 HUD、文字横幅、武器视图、击杀飘字误判成目标。
+开启 `--verify` 后，每个候选框会被单独裁切出来（按 `--verify-margin` 向外扩边），
+再喂给模型问一次「这张裁切图里**真的**有完整可见的目标本体吗？」：
+
+- 模型说 `present=false`，或返回的类别不在候选列表，或复核置信度 `< --verify-threshold` → **剔除**该候选；
+- 模型说 `present=true` → **接受**，并把给出的修正框反投影回全图坐标（多轮时逐轮收敛）；
+- 裁切图会存到 `output_dir/_verify/<stem>/candNN_rR.png`，方便你回看模型到底看到了什么。
+
+```bash
+# 游戏截图检测：挡掉 HUD / 击杀飘字等误检
+python main.py --task-type box --targets "敌人,队友,载具" \
+  --image-dir screens --output-dir out_box_v --output-format json \
+  --verify --verify-domain-hints "游戏截图，注意区分真实角色与界面HUD/血条/击杀提示" \
+  --verify-threshold 0.6
+
+# 多轮收敛：先用初框裁切，再用修正框再裁切再问，最多 2 轮
+python main.py --task-type point --targets "红色圆形,蓝色方块" \
+  --image-dir images --output-dir out_point_v --output-format json \
+  --verify --verify-rounds 2 --verify-margin 0.3
+```
+
+> **提示**：二次验证对每张候选多调用一次模型，会显著增加耗时与 token 消耗；
+> 对误检不敏感的场景可不开。仅 box / point 支持，其他任务类型组合会直接报错退出。
+
 ## 参数表
 
 | 参数 | 必填 | 默认值 | 说明 |
@@ -131,6 +158,11 @@ python main.py --task-type tag --targets "室内,室外,几何,文字,简约,彩
 | `--confidence` | 否 | `0.3` | 置信度阈值，低于该值的项被丢弃（ocr 不过滤） |
 | `--point-box-size` | 否 | `32` | point 导出 yolo/coco 时中心点膨胀成的方框边长（像素），`0` = 零面积框 |
 | `--no-resume` | 否 | 关闭 | 关闭断点续跑，强制重跑全部图片 |
+| `--verify` | 否 | 关闭 | 开启二次验证（harness loop），仅 box/point 有效 |
+| `--verify-rounds` | 否 | `1` | 验证轮数；每轮用上一轮修正框再裁切再问，直到稳定或轮次耗尽 |
+| `--verify-margin` | 否 | `0.25` | 验证时向外扩边比例（相对框尺寸）；point 任务视为裁切半边长（归一化） |
+| `--verify-threshold` | 否 | `0.5` | 复核置信度阈值，低于则剔除该候选 |
+| `--verify-domain-hints` | 否 | 空 | 领域线索写入验证 prompt（如「游戏截图」「医学影像」），帮助模型识别误检 |
 
 ## 格式与任务兼容性
 
@@ -151,7 +183,10 @@ yolo  -> output_dir/labels/<stem>.txt           每图一个
         output_dir/classes.txt                  类别名，行号即 class_index
 csv   -> output_dir/annotations.csv             整批汇总（utf-8-sig）
 coco  -> output_dir/annotations.json            整批汇总（标准 COCO）
+_verify -> output_dir/_verify/<stem>/candNN_rR.png  仅 --verify 时生成，每张候选的复核裁切图（供人工回看）
 ```
+
+> `_verify/` 是中间产物，仅供你肉眼复核「模型究竟看到了什么」，可随时删除，不影响最终标注。
 
 YOLO 行格式（全部为归一化值，6 位小数）：
 
@@ -241,6 +276,15 @@ A：默认 32 像素边长，用 `--point-box-size` 调；传 `0` 得到零面�
 
 **Q：COCO 里 width/height 是 0**
 A：图片尺寸由纯 Python 解析文件头获得，极少数损坏/特殊编码图片会解析失败；安装 Pillow 后会自动回退读取。
+
+**Q：`--verify 仅支持 box / point 任务`**
+A：二次验证是对检测候选做裁切复核，只有 box / point 有「候选位置」可裁切；ocr / caption / tag 请用不带 `--verify` 的普通流程。
+
+**Q：开启 `--verify` 后输出目录多了 `_verify/`**
+A：那是每张候选的复核裁切图（供你回看模型看到了什么），纯中间产物，可随时删除，不影响最终 `json` / `yolo` / `coco` 输出。
+
+**Q：二次验证把原本正确的框也剔除了**
+A：优先排查 `--verify-threshold`（默认 0.5，调低更易接受）与 `--verify-domain-hints`（给模型更明确的误检界定）。若模型对裁切子图判断不稳，可减小 `--verify-margin` 让裁切更贴合目标本身。
 
 **Q：处理速度慢**
 A：视觉模型推理本身耗时，可用 `--workers 4` 并发（注意显存/内存占用）。

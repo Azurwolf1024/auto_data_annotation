@@ -39,6 +39,34 @@ class BoxAnnotation(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# verify（harness loop 二次验证）
+# --------------------------------------------------------------------------- #
+class VerifyAnnotation(BaseModel):
+    """验证阶段：对单张「裁切子图」判断其中是否真有完整、可见的目标本体。
+
+    由 harness 在 box / point 检测之后调用：把每个候选框（或点周围区域）裁切出来，
+    单独喂给模型复核。
+
+    - present=false：裁切内没有真实目标本体（如只有 HUD / 光效 / 文字横幅 /
+      武器视图 / 击杀飘字等），调用方据此剔除该候选；
+    - present=true：要求模型给出紧贴该真实目标的「相对本张裁切图」归一化修正框。
+    """
+
+    present: bool = Field(..., description="裁切区内是否真有完整、可见的目标本体")
+    label: str = Field(
+        "",
+        description="目标类别，必须来自候选列表；无目标时为空串",
+    )
+    confidence: float = Field(
+        0.0, description="对本次判断的置信度，0~1 之间的小数"
+    )
+    x_min: float = Field(0.0, description="修正框左上角 x，相对本张裁切图归一化到 0~1")
+    y_min: float = Field(0.0, description="修正框左上角 y，相对本张裁切图归一化到 0~1")
+    x_max: float = Field(0.0, description="修正框右下角 x，相对本张裁切图归一化到 0~1")
+    y_max: float = Field(0.0, description="修正框右下角 y，相对本张裁切图归一化到 0~1")
+
+
+# --------------------------------------------------------------------------- #
 # point
 # --------------------------------------------------------------------------- #
 class PointItem(BaseModel):
@@ -152,4 +180,5 @@ __all__ = [
     "TagAnnotation",
     "AnnotationResult",
     "SCHEMA_MAP",
+    "VerifyAnnotation",
 ]

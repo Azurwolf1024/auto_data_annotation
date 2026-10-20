@@ -77,6 +77,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="关闭断点续跑，重新处理所有图片",
     )
+    # ---- 二次验证（harness loop）----
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="开启二次验证：box/point 检测后再逐候选裁切复核，剔除误检（HUD/文字横幅/武器视图等）",
+    )
+    parser.add_argument(
+        "--verify-rounds",
+        type=int,
+        default=1,
+        help="验证轮数，默认 1；每轮用上一轮修正框再裁切再问，直到稳定或轮次耗尽",
+    )
+    parser.add_argument(
+        "--verify-margin",
+        type=float,
+        default=0.25,
+        help="验证时向外扩边比例（相对框尺寸）；point 任务视为裁切半边长（归一化），默认 0.25",
+    )
+    parser.add_argument(
+        "--verify-threshold",
+        type=float,
+        default=0.5,
+        help="复核置信度阈值，低于则剔除该候选，默认 0.5",
+    )
+    parser.add_argument(
+        "--verify-domain-hints",
+        default="",
+        help="领域线索，写入验证 prompt（例如『游戏截图』『医学影像』），帮助模型识别误检",
+    )
     return parser
 
 
