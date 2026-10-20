@@ -563,8 +563,13 @@ def _count_of(task_type: str, result: Dict) -> int:
     return len(value) if isinstance(value, list) else 0
 
 
-def annotate_image(image: Path, config: Config) -> AnnotationResult:
-    """处理单张图片：build_prompt -> annotate -> clean -> (可选)二次验证 -> 封装。"""
+def annotate_image(image: Path, config: Config, zoom_client=None) -> AnnotationResult:
+    """处理单张图片：build_prompt -> annotate -> clean -> (可选)二次验证 -> 封装。
+
+    zoom_client 可选：由 run() 在整批处理中复用的放大客户端（MCP / 本地）。
+    若未传入且本图需要放大精修，则临时新建并在本函数内关闭（直接调用本函数的
+    场景，如单测）。
+    """
     task_type = config.task_type
     prompt = build_prompt(task_type, config.targets)
     schema_class = SCHEMA_MAP[task_type]
@@ -625,17 +630,21 @@ def annotate_image(image: Path, config: Config) -> AnnotationResult:
     # 放大精修（zoom-on-uncertain）：低置信度候选放大后重新标注并映射回原图
     if config.zoom_on_uncertain and task_type in ("box", "point"):
         if pil_image is not None and image_size is not None:
+            own_zoom = zoom_client is None
             try:
-                zoom_client = make_zoom_client(config)
+                if own_zoom:
+                    zoom_client = make_zoom_client(config)
                 cleaned = zoom_refine(
                     image_path=str(image),
                     cleaned=cleaned,
                     config=config,
                     zoom_client=zoom_client,
                 )
-                zoom_client.close()
             except Exception as exc:  # noqa: BLE001 - 放大失败则保留原结果
                 print(f"  ⚠ {image.name} 放大精修失败，保留原结果：{exc}", flush=True)
+            finally:
+                if own_zoom and zoom_client is not None:
+                    zoom_client.close()
         else:
             print(f"  ⚠ {image.name} 无法读取图片尺寸，跳过放大精修", flush=True)
 
@@ -648,10 +657,10 @@ def annotate_image(image: Path, config: Config) -> AnnotationResult:
     )
 
 
-def _process_one(index: int, total: int, image: Path, config: Config) -> AnnotationResult:
+def _process_one(index: int, total: int, image: Path, config: Config, zoom_client=None) -> AnnotationResult:
     """单图处理 + 进度日志 + 异常兜底。"""
     try:
-        result = annotate_image(image, config)
+        result = annotate_image(image, config, zoom_client=zoom_client)
         count = _count_of(config.task_type, result.result)
         unit = _COUNT_UNIT.get(config.task_type, "items")
         print(f"[{index}/{total}] {image.name} → {count} {unit}", flush=True)
@@ -702,20 +711,40 @@ def run(config: Config) -> List[AnnotationResult]:
         print("没有需要处理的图片。")
         return results
 
+    # 放大精修需要的 MCP / 本地客户端在整批内只创建一次并复用：
+    # - 跨图复用避免每张图都拉起/销毁子进程；
+    # - MCPZoomClient 已加锁，--workers 并发下共享也安全。
+    shared_zoom = None
+    if config.zoom_on_uncertain and config.task_type in ("box", "point"):
+        try:
+            shared_zoom = make_zoom_client(config)
+            print(f"  放大服务已就绪（{type(shared_zoom).__name__}）", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 启动失败则每张图内部回退
+            print(f"  ⚠ 放大服务启动失败，改为每张图内回退：{exc}", flush=True)
+            shared_zoom = None
+
     tasks = [(idx, image) for idx, image in enumerate(pending, start=1)]
     total_pending = len(pending)
 
-    if config.workers > 1:
-        with ThreadPoolExecutor(max_workers=config.workers) as executor:
-            futures = [
-                executor.submit(_process_one, idx, total_pending, image, config)
-                for idx, image in tasks
-            ]
-            for future in futures:
-                results.append(future.result())
-    else:
-        for idx, image in tasks:
-            results.append(_process_one(idx, total_pending, image, config))
+    try:
+        if config.workers > 1:
+            with ThreadPoolExecutor(max_workers=config.workers) as executor:
+                futures = [
+                    executor.submit(
+                        _process_one, idx, total_pending, image, config, shared_zoom
+                    )
+                    for idx, image in tasks
+                ]
+                for future in futures:
+                    results.append(future.result())
+        else:
+            for idx, image in tasks:
+                results.append(
+                    _process_one(idx, total_pending, image, config, shared_zoom)
+                )
+    finally:
+        if shared_zoom is not None:
+            shared_zoom.close()
 
     failed = sum(1 for r in results if r.status != "ok")
     print(f"处理完成：成功 {len(results) - failed} 张，失败 {failed} 张")

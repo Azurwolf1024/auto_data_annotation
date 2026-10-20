@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from typing import Dict, Tuple
 
 # 项目根目录（含 mcp_server/ 与 src/）
@@ -87,28 +88,36 @@ class MCPZoomClient:
             [sys.executable, self.server_script],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # stderr 不接管：避免服务进程写 stderr 撑满管道导致死锁；
+            # 服务本身只在异常时向 stderr 报错，父进程无需读取。
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
         self._id = 0
         self._started = False
+        # 串行化「写请求 + 读应答」，保证该客户端在多线程（--workers）下
+        # 被共享时不会把不同调用的请求/应答交错，导致协议错乱。
+        self._lock = threading.Lock()
 
     # ---- 底层传输 ----
     def _send(self, method: str, params=None, *, notification: bool = False):
-        self._id += 1
-        msg = {"jsonrpc": "2.0", "method": method}
-        if not notification:
-            msg["id"] = self._id
-        if params is not None:
-            msg["params"] = params
-        self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
-        if notification:
-            return None
-        return self._recv(self._id)
+        # 锁覆盖「写请求 + 读应答」，保证多线程共享时一次调用原子完成
+        with self._lock:
+            self._id += 1
+            msg = {"jsonrpc": "2.0", "method": method}
+            if not notification:
+                msg["id"] = self._id
+            if params is not None:
+                msg["params"] = params
+            self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+            if notification:
+                return None
+            return self._recv(self._id)
 
     def _recv(self, want_id):
+        # 调用方（_send）已持有 self._lock
         while True:
             line = self.proc.stdout.readline()
             if not line:
