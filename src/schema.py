@@ -30,11 +30,35 @@ class BoundingBox(BaseModel):
     y_max: float = Field(..., description="框右下角 y 坐标，归一化到 0~1")
 
 
+class ZoomRegion(BaseModel):
+    """模型主动请求「放大细看」的归一化区域。
+
+    由 box / point 任务的结构化输出携带：模型在初次检测后，若认为某区域太小、
+    太模糊或不确定，可声明一个归一化矩形（及简短原因）。harness 随后调用裁剪
+    放大工具对该区域重新标注，并把结果映射回原图。这是「模型主动 call 工具」
+    的实现方式（在结构化输出中表达放大意图）。
+    """
+
+    x_min: float = Field(..., description="区域左上角 x 坐标，归一化到 0~1")
+    y_min: float = Field(..., description="区域左上角 y 坐标，归一化到 0~1")
+    x_max: float = Field(..., description="区域右下角 x 坐标，归一化到 0~1")
+    y_max: float = Field(..., description="区域右下角 y 坐标，归一化到 0~1")
+    reason: str = Field("", description="为何要放大（可选，仅用于日志排查）")
+
+
 class BoxAnnotation(BaseModel):
     """box 任务的顶层结构。"""
 
     objects: List[BoundingBox] = Field(
         default_factory=list, description="图中所有检测到的目标框，没有目标时为空数组"
+    )
+    zoom_regions: List[ZoomRegion] = Field(
+        default_factory=list,
+        description=(
+            "模型认为需要放大细看的归一化区域；harness 会调用裁剪放大工具对每"
+            "个区域重新标注并映射回原图，从而提升小目标/模糊目标的定位精度。"
+            "无需放大时留空数组"
+        ),
     )
 
 
@@ -83,6 +107,14 @@ class PointAnnotation(BaseModel):
 
     points: List[PointItem] = Field(
         default_factory=list, description="图中所有物体的中心点，没有目标时为空数组"
+    )
+    zoom_regions: List[ZoomRegion] = Field(
+        default_factory=list,
+        description=(
+            "模型认为需要放大细看的归一化区域（围绕不确定的点取一小块即可）；"
+            "harness 会调用裁剪放大工具对该区域重新标注并映射回原图。"
+            "无需放大时留空数组"
+        ),
     )
 
 
@@ -171,6 +203,7 @@ SCHEMA_MAP = {
 __all__ = [
     "BoundingBox",
     "BoxAnnotation",
+    "ZoomRegion",
     "PointItem",
     "PointAnnotation",
     "OcrBlock",

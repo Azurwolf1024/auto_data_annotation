@@ -47,11 +47,17 @@ def build_prompt(task_type: str, targets: List[str] = None) -> str:
             "2. 不在候选列表中的物体直接忽略，不要输出；\n"
             "3. confidence 是 0~1 之间的小数，表示你对该目标的置信程度；\n"
             "4. 每个目标给出紧贴物体边缘的矩形框（x_min, y_min, x_max, y_max）；\n"
-            f"5. {NORM_HINT}\n"
+            "5. 如果某个目标太小、太模糊、被遮挡或你不确定（例如远处的小物体），"
+            "把它所在的区域写入 zoom_regions（归一化矩形 + 简短 reason），"
+            "系统会自动放大该区域再识别一次并映射回原图，从而提升定位精度；"
+            "无需放大时 zoom_regions 留空数组；\n"
+            f"6. {NORM_HINT}\n"
             f"{NO_EXPLAIN}\n"
             '输出格式：{"objects": [{"label": "类别", "confidence": 0.95, '
-            '"x_min": 0.12, "y_min": 0.34, "x_max": 0.56, "y_max": 0.78}]}\n'
-            '如果图中没有任何候选目标，输出 {"objects": []}。'
+            '"x_min": 0.12, "y_min": 0.34, "x_max": 0.56, "y_max": 0.78}], '
+            '"zoom_regions": [{"x_min": 0.7, "y_min": 0.1, "x_max": 0.85, '
+            '"y_max": 0.3, "reason": "远处小目标模糊"}]}\n'
+            '如果图中没有任何候选目标，输出 {"objects": [], "zoom_regions": []}。'
         )
 
     if task_type == "point":
@@ -64,11 +70,16 @@ def build_prompt(task_type: str, targets: List[str] = None) -> str:
             "2. 不在候选列表中的物体直接忽略，不要输出；\n"
             "3. 只标注物体的几何中心点，不要标注人体关节等结构化关键点；\n"
             "4. confidence 是 0~1 之间的小数，表示你对该目标的置信程度；\n"
-            f"5. {NORM_HINT}\n"
+            "5. 如果某个点你不确定（太小/太模糊/被遮挡），把它周围一小块区域写入 "
+            "zoom_regions（归一化矩形 + 简短 reason），系统会放大该区域再识别一次并"
+            "映射回原图；无需放大时 zoom_regions 留空数组；\n"
+            f"6. {NORM_HINT}\n"
             f"{NO_EXPLAIN}\n"
             '输出格式：{"points": [{"label": "类别", "confidence": 0.92, '
-            '"x": 0.45, "y": 0.51}]}\n'
-            '如果图中没有任何候选目标，输出 {"points": []}。'
+            '"x": 0.45, "y": 0.51}], '
+            '"zoom_regions": [{"x_min": 0.4, "y_min": 0.45, "x_max": 0.5, '
+            '"y_max": 0.55, "reason": "点不确定"}]}\n'
+            '如果图中没有任何候选目标，输出 {"points": [], "zoom_regions": []}。'
         )
 
     if task_type == "ocr":

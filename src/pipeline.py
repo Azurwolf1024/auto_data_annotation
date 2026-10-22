@@ -359,182 +359,232 @@ def harness_verify(
 # --------------------------------------------------------------------------- #
 # 放大精修（zoom-on-uncertain）：模型不确定时放大、重新标注、映射回原图
 # --------------------------------------------------------------------------- #
-def _zoom_refine_boxes(
-    image_path: str,
-    objects: List[Dict[str, Any]],
-    config: Config,
-    zoom_client,
-) -> List[Dict[str, Any]]:
-    """对置信度低于阈值的 box 候选放大精修，支持多级（递归）放大。
+def _norm_region(r) -> Optional[Tuple[float, float, float, float]]:
+    """把 dict / 4 元组归一化区域解析成 (x0,y0,x1,y1)，非法或退化返回 None。"""
+    try:
+        if isinstance(r, dict):
+            x0, y0, x1, y1 = r["x_min"], r["y_min"], r["x_max"], r["y_max"]
+        elif isinstance(r, (tuple, list)) and len(r) == 4:
+            x0, y0, x1, y1 = r
+        else:
+            return None
+        x0, y0, x1, y1 = clamp(float(x0)), clamp(float(y0)), clamp(float(x1)), clamp(float(y1))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if x1 - x0 <= 0.0 or y1 - y0 <= 0.0:
+        return None
+    return (x0, y0, x1, y1)
 
-    流程（单候选）：
-    1. 以候选框为 local 子矩形，调用裁切放大服务得到裁切图 + 原图矩形 region；
-    2. 把裁切图再次喂给 box 检测模型，筛出同类目标；
-    3. 若置信度仍低于阈值且未达最大级数，以该检测框为新的 local、以上一级
-       region 为新 region，进入更深一层放大（坐标随 region 一路 compose 回原图）；
-    4. 命中或耗尽级数后，用最终的 region 把局部框映射回原图坐标，替换原候选。
+
+def _normalize_regions(regions, image_size=None) -> List[Dict[str, Any]]:
+    """把模型返回的 zoom_regions 整理成合法归一化区域。
+
+    小模型经常把坐标写成**像素值**而不是 0~1（与它输出 box 坐标时同样的毛病）。
+    这类区域若直接丢弃，「模型主动放大」会静默失效，因此这里按图片尺寸换算回来，
+    再交给 _norm_region 做 clamp 与合法性过滤。
+
+    返回形如 [{"x_min","y_min","x_max","y_max","reason"}, ...] 的列表。
     """
-    targets = config.targets
-    stem = Path(image_path).stem
-    zoom_dir = Path(config.output_dir) / "_zoom" / stem
-    os.makedirs(zoom_dir, exist_ok=True)
+    width = height = None
+    if image_size:
+        try:
+            width, height = int(image_size[0]), int(image_size[1])
+        except (TypeError, ValueError, IndexError):
+            width = height = None
 
-    refined: List[Dict[str, Any]] = []
-    for idx, obj in enumerate(objects, start=1):
-        if float(obj.get("confidence", 0.0)) >= config.zoom_threshold:
-            refined.append(obj)
+    out: List[Dict[str, Any]] = []
+    for r in regions or []:
+        try:
+            if isinstance(r, dict):
+                x0 = float(r["x_min"]); y0 = float(r["y_min"])
+                x1 = float(r["x_max"]); y1 = float(r["y_max"])
+                reason = str(r.get("reason", "") or "")
+            elif isinstance(r, (list, tuple)) and len(r) == 4:
+                x0, y0, x1, y1 = (float(v) for v in r)
+                reason = ""
+            else:
+                continue
+        except (KeyError, TypeError, ValueError):
             continue
 
-        region = {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}
-        cur_image = image_path
-        local = (obj["x_min"], obj["y_min"], obj["x_max"], obj["y_max"])
-        best = None
-        best_region = region
+        # 明显超出 0~1 → 判定为像素坐标，按图片尺寸归一化
+        if max(x0, x1, y0, y1) > 1.0 and width and height:
+            x0, x1 = x0 / width, x1 / width
+            y0, y1 = y0 / height, y1 / height
 
-        for lvl in range(1, config.zoom_max_levels + 1):
-            try:
-                data = zoom_client.crop_and_upscale(
-                    cur_image, region, local, config.zoom_upscale, str(zoom_dir),
-                    tag=f"cand{idx}_L{lvl}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"    ✗ cand{idx} 第{lvl}级放大调用失败：{exc}", flush=True)
-                break
-            crop_path = data["cropped_image_path"]
-            composed = data["region"]
-            try:
-                raw = annotate(
-                    crop_path, build_prompt("box", targets), BoxAnnotation, config
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"    ✗ cand{idx} 第{lvl}级放大标注失败：{exc}", flush=True)
-                break
-
-            dets = clean(raw, "box", targets, 0.0).get("objects", [])
-            dets = [d for d in dets if d.get("label") == obj.get("label")]
-            if not dets:
-                print(f"    · cand{idx} 第{lvl}级放大未检出同类目标", flush=True)
-                break
-
-            cur = max(dets, key=lambda d: float(d.get("confidence", 0.0)))
-            best = cur
-            best_region = composed
-            if float(cur.get("confidence", 0.0)) >= config.zoom_threshold:
-                print(
-                    f"    ✓ cand{idx} 第{lvl}级放大后置信度提升至 "
-                    f"{cur['confidence']:.2f}",
-                    flush=True,
-                )
-                break
-            # 继续更深放大：以当前检测框为新的 local（相对本裁切图）
-            local = (cur["x_min"], cur["y_min"], cur["x_max"], cur["y_max"])
-            region = composed
-            cur_image = crop_path
-
-        if best is not None:
-            orig = zoom_client.map_box_to_original(
-                best_region, (best["x_min"], best["y_min"], best["x_max"], best["y_max"])
-            )
-            refined.append(
+        reg = _norm_region((x0, y0, x1, y1))
+        if reg:
+            out.append(
                 {
-                    "label": obj["label"],
-                    "confidence": round(float(best.get("confidence", obj.get("confidence", 0.0))), 4),
-                    "x_min": round(orig["x_min"], 6),
-                    "y_min": round(orig["y_min"], 6),
-                    "x_max": round(orig["x_max"], 6),
-                    "y_max": round(orig["y_max"], 6),
+                    "x_min": reg[0], "y_min": reg[1],
+                    "x_max": reg[2], "y_max": reg[3],
+                    "reason": reason,
                 }
             )
-        else:
-            refined.append(obj)
-
-    print(f"  放大精修：{len(refined)}/{len(objects)} 个框完成", flush=True)
-    return refined
+    return out
 
 
-def _zoom_refine_points(
-    image_path: str,
-    points: List[Dict[str, Any]],
-    config: Config,
+def _region_of_obj(obj: Dict[str, Any], task_type: str, margin: float):
+    """从已有检测项构造裁切区域：box 用其框；point 用点周围方形（半边长 margin）。"""
+    if task_type == "box":
+        return _norm_region((obj["x_min"], obj["y_min"], obj["x_max"], obj["y_max"]))
+    x = clamp(obj.get("x", 0.0))
+    y = clamp(obj.get("y", 0.0))
+    m = max(0.0, float(margin))
+    return _norm_region((clamp(x - m), clamp(y - m), clamp(x + m), clamp(y + m)))
+
+
+def _iou(box_a, box_b) -> float:
+    ax0, ay0, ax1, ay1 = box_a
+    bx0, by0, bx1, by1 = box_b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    a = (ax1 - ax0) * (ay1 - ay0)
+    b = (bx1 - bx0) * (by1 - by0)
+    union = a + b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _collect_seeds(task_type: str, cleaned: Dict[str, Any], model_regions, config):
+    """收集需要放大的种子区域。
+
+    - model / both 模式：模型在结构化输出里声明的 zoom_regions（模型主动 call 工具）；
+    - threshold / both 模式：低置信候选（旧行为）。
+    """
+    seeds: List[Dict[str, Any]] = []
+    if config.zoom_mode in ("model", "both"):
+        for r in model_regions or []:
+            reg = _norm_region(r)
+            if reg:
+                seeds.append({"region": reg, "label": None, "src": "model"})
+    if config.zoom_mode in ("threshold", "both"):
+        key = "objects" if task_type == "box" else "points"
+        for o in cleaned.get(key, []):
+            if float(o.get("confidence", 0.0)) < config.zoom_threshold:
+                reg = _region_of_obj(o, task_type, config.zoom_margin)
+                if reg:
+                    seeds.append({"region": reg, "label": o.get("label"), "src": "threshold"})
+    return seeds
+
+
+def _zoom_chain(
+    image_path,
+    full_region,
+    seed_region,
+    task_type,
+    config,
     zoom_client,
-) -> List[Dict[str, Any]]:
-    """对置信度低于阈值的 point 候选放大精修（围绕点取方形区域裁切），支持多级。"""
-    targets = config.targets
-    stem = Path(image_path).stem
-    zoom_dir = Path(config.output_dir) / "_zoom" / stem
-    os.makedirs(zoom_dir, exist_ok=True)
-    m = config.zoom_margin
+    zoom_dir,
+    depth,
+    label_filter,
+    tag_prefix,
+):
+    """对一个种子区域执行一次放大+重标注，并递归处理裁切图里的 zoom_regions。
 
-    refined: List[Dict[str, Any]] = []
-    for idx, pt in enumerate(points, start=1):
-        if float(pt.get("confidence", 0.0)) >= config.zoom_threshold:
-            refined.append(pt)
+    返回：相对【原图】坐标系的检测项列表（dict）。
+    """
+    is_box = task_type == "box"
+    tag = f"{tag_prefix}_L{depth}"
+    try:
+        data = zoom_client.crop_and_upscale(
+            image_path, full_region, seed_region, config.zoom_upscale, str(zoom_dir), tag=tag
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"    ✗ 放大调用失败（{tag}）：{exc}", flush=True)
+        return []
+    crop_path = data["cropped_image_path"]
+    cropped_region = data["region"]  # 该裁切图相对原图的矩形（已 compose）
+    try:
+        raw = annotate(
+            crop_path, build_prompt(task_type, config.targets), SCHEMA_MAP[task_type], config
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"    ✗ 放大标注失败（{tag}）：{exc}", flush=True)
+        return []
+
+    dets = clean(raw, task_type, config.targets, 0.0)
+    key = "objects" if is_box else "points"
+    items = dets.get(key, [])
+    if label_filter:
+        items = [d for d in items if d.get("label") == label_filter]
+
+    mapped: List[Dict[str, Any]] = []
+    for d in items:
+        try:
+            if is_box:
+                o = zoom_client.map_box_to_original(
+                    cropped_region, (d["x_min"], d["y_min"], d["x_max"], d["y_max"])
+                )
+                mapped.append(
+                    {
+                        "label": d["label"],
+                        "confidence": round(float(d["confidence"]), 4),
+                        "x_min": round(o["x_min"], 6),
+                        "y_min": round(o["y_min"], 6),
+                        "x_max": round(o["x_max"], 6),
+                        "y_max": round(o["y_max"], 6),
+                    }
+                )
+            else:
+                o = zoom_client.map_point_to_original(cropped_region, d["x"], d["y"])
+                mapped.append(
+                    {
+                        "label": d["label"],
+                        "confidence": round(float(d["confidence"]), 4),
+                        "x": round(o["x"], 6),
+                        "y": round(o["y"], 6),
+                    }
+                )
+        except Exception:  # noqa: BLE001
             continue
 
-        x = clamp(pt.get("x", 0.0))
-        y = clamp(pt.get("y", 0.0))
-        region = {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}
-        cur_image = image_path
-        local = (clamp(x - m), clamp(y - m), clamp(x + m), clamp(y + m))
-        best = None
-        best_region = region
-
-        for lvl in range(1, config.zoom_max_levels + 1):
-            try:
-                data = zoom_client.crop_and_upscale(
-                    cur_image, region, local, config.zoom_upscale, str(zoom_dir),
-                    tag=f"pt{idx}_L{lvl}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"    ✗ pt{idx} 第{lvl}级放大调用失败：{exc}", flush=True)
-                break
-            crop_path = data["cropped_image_path"]
-            composed = data["region"]
-            try:
-                raw = annotate(
-                    crop_path, build_prompt("point", targets), PointAnnotation, config
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"    ✗ pt{idx} 第{lvl}级放大标注失败：{exc}", flush=True)
-                break
-
-            dets = clean(raw, "point", targets, 0.0).get("points", [])
-            dets = [d for d in dets if d.get("label") == pt.get("label")]
-            if not dets:
-                print(f"    · pt{idx} 第{lvl}级放大未检出同类目标", flush=True)
-                break
-
-            cur = max(dets, key=lambda d: float(d.get("confidence", 0.0)))
-            best = cur
-            best_region = composed
-            if float(cur.get("confidence", 0.0)) >= config.zoom_threshold:
-                print(
-                    f"    ✓ pt{idx} 第{lvl}级放大后置信度提升至 "
-                    f"{cur['confidence']:.2f}",
-                    flush=True,
-                )
-                break
-            cx = clamp(cur.get("x", 0.0))
-            cy = clamp(cur.get("y", 0.0))
-            local = (clamp(cx - m), clamp(cy - m), clamp(cx + m), clamp(cy + m))
-            region = composed
-            cur_image = crop_path
-
-        if best is not None:
-            orig = zoom_client.map_point_to_original(best_region, best.get("x", 0.0), best.get("y", 0.0))
-            refined.append(
-                {
-                    "label": pt["label"],
-                    "confidence": round(float(best.get("confidence", pt.get("confidence", 0.0))), 4),
-                    "x": round(orig["x"], 6),
-                    "y": round(orig["y"], 6),
-                }
+    # 模型驱动的多级放大：裁切图若再声明 zoom_regions，则继续更深一层
+    # （裁切图里的坐标同样可能是像素值，按裁切图自身尺寸换算）
+    if depth < config.zoom_max_levels and config.zoom_mode in ("model", "both"):
+        sub_regions = _normalize_regions(raw.get("zoom_regions") or [], data.get("size"))
+        for j, r in enumerate(sub_regions, start=1):
+            sub = (r["x_min"], r["y_min"], r["x_max"], r["y_max"])
+            mapped += _zoom_chain(
+                crop_path,
+                cropped_region,
+                sub,
+                task_type,
+                config,
+                zoom_client,
+                zoom_dir,
+                depth + 1,
+                None,
+                f"{tag_prefix}_s{j}",
             )
-        else:
-            refined.append(pt)
+    return mapped
 
-    print(f"  放大精修：{len(refined)}/{len(points)} 个点完成", flush=True)
-    return refined
+
+def _merge_detections(existing, additions, task_type, iou_thr=0.5) -> List[Dict[str, Any]]:
+    """把放大得到的新检测合并进原结果：与同标签已有项 IoU/距离重合则替换，否则追加。"""
+    merged = [dict(e) for e in existing]
+    for add in additions:
+        replaced = False
+        if task_type == "box":
+            for i, ex in enumerate(merged):
+                if ex.get("label") == add.get("label") and _iou(
+                    (ex["x_min"], ex["y_min"], ex["x_max"], ex["y_max"]),
+                    (add["x_min"], add["y_min"], add["x_max"], add["y_max"]),
+                ) >= iou_thr:
+                    merged[i] = add
+                    replaced = True
+                    break
+        else:
+            for i, ex in enumerate(merged):
+                d = ((ex["x"] - add["x"]) ** 2 + (ex["y"] - add["y"]) ** 2) ** 0.5
+                if ex.get("label") == add.get("label") and d <= 0.02:
+                    merged[i] = add
+                    replaced = True
+                    break
+        if not replaced:
+            merged.append(add)
+    return merged
 
 
 def zoom_refine(
@@ -542,16 +592,46 @@ def zoom_refine(
     cleaned: Dict[str, Any],
     config: Config,
     zoom_client,
+    model_regions=None,
 ) -> Dict[str, Any]:
-    """放大精修入口，按任务类型分派到 box / point。"""
+    """放大精修入口（模型主动请求 +/或低置信触发），按任务类型处理并合并结果。
+
+    模型在结构化输出里声明的 zoom_regions 会作为种子；若 zoom_mode 含
+    threshold，低置信候选也会作为种子。每个种子调用裁剪放大工具、重新标注、
+    映射回原图，最终按 IoU/距离合并（重合的同类检测以精修结果替换，新发现则追加）。
+    """
+    if config.task_type not in ("box", "point"):
+        return cleaned
+
+    stem = Path(image_path).stem
+    zoom_dir = Path(config.output_dir) / "_zoom" / stem
+    os.makedirs(zoom_dir, exist_ok=True)
+
+    seeds = _collect_seeds(config.task_type, cleaned, model_regions, config)
+    additions: List[Dict[str, Any]] = []
+    for idx, seed in enumerate(seeds, start=1):
+        additions += _zoom_chain(
+            image_path,
+            (0.0, 0.0, 1.0, 1.0),  # 原图相对自身的矩形
+            seed["region"],
+            config.task_type,
+            config,
+            zoom_client,
+            zoom_dir,
+            1,
+            seed["label"],
+            f"s{idx}",
+        )
+
     if config.task_type == "box":
-        cleaned["objects"] = _zoom_refine_boxes(
-            image_path, cleaned.get("objects", []), config, zoom_client
-        )
-    elif config.task_type == "point":
-        cleaned["points"] = _zoom_refine_points(
-            image_path, cleaned.get("points", []), config, zoom_client
-        )
+        cleaned["objects"] = _merge_detections(cleaned.get("objects", []), additions, "box")
+    else:
+        cleaned["points"] = _merge_detections(cleaned.get("points", []), additions, "point")
+
+    print(
+        f"  放大精修：{len(additions)} 个精修结果来自 {len(seeds)} 个种子区域",
+        flush=True,
+    )
     return cleaned
 
 
@@ -613,6 +693,10 @@ def annotate_image(image: Path, config: Config, zoom_client=None) -> AnnotationR
         image_size=image_size,
     )
 
+    # 模型可能主动声明 zoom_regions（模型主动 call 裁剪放大工具）。
+    # 必须在拿到 image_size 之后再整理：模型可能给的是像素坐标，需要换算回 0~1。
+    model_regions = _normalize_regions(raw.get("zoom_regions") or [], image_size)
+
     # 二次验证（harness loop）：box / point 检测后再逐候选裁切复核
     if config.verify and task_type in ("box", "point"):
         if pil_image is not None and image_size is not None:
@@ -639,6 +723,7 @@ def annotate_image(image: Path, config: Config, zoom_client=None) -> AnnotationR
                     cleaned=cleaned,
                     config=config,
                     zoom_client=zoom_client,
+                    model_regions=model_regions,
                 )
             except Exception as exc:  # noqa: BLE001 - 放大失败则保留原结果
                 print(f"  ⚠ {image.name} 放大精修失败，保留原结果：{exc}", flush=True)
@@ -647,6 +732,18 @@ def annotate_image(image: Path, config: Config, zoom_client=None) -> AnnotationR
                     zoom_client.close()
         else:
             print(f"  ⚠ {image.name} 无法读取图片尺寸，跳过放大精修", flush=True)
+
+    # 自动可视化：把最终标注（框/点/文字框）画回原图，供人工检查
+    if config.visualize and task_type in ("box", "point", "ocr"):
+        try:
+            from .visualize import draw_result
+            viz_dir = config.viz_dir or os.path.join(config.output_dir, "_viz")
+            os.makedirs(viz_dir, exist_ok=True)
+            viz_path = os.path.join(viz_dir, f"{Path(image).stem}.png")
+            draw_result(str(image), cleaned, config.task_type, viz_path)
+            print(f"  可视化标注图：{viz_path}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠ {image.name} 可视化失败：{exc}", flush=True)
 
     return AnnotationResult(
         task_type=task_type,
@@ -759,6 +856,4 @@ __all__ = [
     "_verify_boxes",
     "_verify_points",
     "zoom_refine",
-    "_zoom_refine_boxes",
-    "_zoom_refine_points",
 ]

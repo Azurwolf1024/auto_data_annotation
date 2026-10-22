@@ -31,6 +31,7 @@ DEFAULT_ZOOM_UPSCALE = 2
 DEFAULT_ZOOM_THRESHOLD = 0.3
 DEFAULT_ZOOM_MAX_LEVELS = 2
 DEFAULT_ZOOM_MARGIN = 0.25
+DEFAULT_ZOOM_MODE = "model"  # model=模型主动请求 / threshold=低置信触发 / both=两者
 
 
 def parse_targets(raw) -> List[str]:
@@ -80,6 +81,12 @@ class Config:
     zoom_margin: float = DEFAULT_ZOOM_MARGIN
     zoom_via_mcp: bool = True
     zoom_server: str = ""
+    # 放大触发方式：model=仅模型主动请求的 zoom_regions；threshold=仅低置信触发；
+    # both=两者都触发。默认 model（模型主动 call 裁剪放大工具）。
+    zoom_mode: str = DEFAULT_ZOOM_MODE
+    # 自动可视化：把最终标注（框/点/文字框）画回原图供人工检查
+    visualize: bool = False
+    viz_dir: str = ""  # 可视化输出目录，默认 <output_dir>/_viz
 
     # ------------------------------------------------------------------ #
     def validate(self) -> "Config":
@@ -172,6 +179,10 @@ class Config:
             )
 
         if self.zoom_on_uncertain:
+            if self.zoom_mode not in ("model", "threshold", "both"):
+                raise ValueError(
+                    f"zoom_mode 必须是 model/threshold/both 之一，当前为 {self.zoom_mode!r}"
+                )
             try:
                 self.zoom_upscale = int(self.zoom_upscale)
             except (TypeError, ValueError):
@@ -269,6 +280,13 @@ class Config:
             ),
             zoom_via_mcp=bool(getattr(args, "zoom_via_mcp", True)),
             zoom_server=str(getattr(args, "zoom_server", "") or ""),
+            zoom_mode=str(
+                getattr(args, "zoom_mode", DEFAULT_ZOOM_MODE) or DEFAULT_ZOOM_MODE
+            )
+            .strip()
+            .lower(),
+            visualize=bool(getattr(args, "visualize", False)),
+            viz_dir=str(getattr(args, "viz_dir", "") or ""),
         )
 
     # ------------------------------------------------------------------ #
@@ -287,10 +305,12 @@ class Config:
             )
             + (
                 f" zoom=on up={self.zoom_upscale} thr={self.zoom_threshold} "
-                f"levels={self.zoom_max_levels} mcp={self.zoom_via_mcp}"
+                f"levels={self.zoom_max_levels} mode={self.zoom_mode} "
+                f"mcp={self.zoom_via_mcp}"
                 if self.zoom_on_uncertain
                 else ""
             )
+            + (f" visualize=on dir={self.viz_dir or '<output>/_viz'}" if self.visualize else "")
         )
 
 
@@ -309,5 +329,6 @@ __all__ = [
     "DEFAULT_ZOOM_THRESHOLD",
     "DEFAULT_ZOOM_MAX_LEVELS",
     "DEFAULT_ZOOM_MARGIN",
+    "DEFAULT_ZOOM_MODE",
     "parse_targets",
 ]

@@ -44,7 +44,14 @@ def clamp(v: float) -> float:
 
 
 def _region_of(region) -> tuple:
-    """从 dict / 任意对象里取出归一化矩形四角。"""
+    """从各种矩形表示里取出归一化四角 (x_min, y_min, x_max, y_max)。
+
+    兼容三种常见写法，避免调用方/传输格式差异导致失败：
+    1. dict：{"x_min", "y_min", "x_max", "y_max"}（MCP JSON 对象）；
+    2. 长度为 4 的数组/元组：[x_min, y_min, x_max, y_max]
+       （注意：JSON 传输会把 tuple 序列化成 list，故必须支持）；
+    3. 带同名属性的对象（进程内直接调用时常见）。
+    """
     if isinstance(region, dict):
         return (
             float(region["x_min"]),
@@ -52,6 +59,8 @@ def _region_of(region) -> tuple:
             float(region["x_max"]),
             float(region["y_max"]),
         )
+    if isinstance(region, (list, tuple)) and len(region) == 4:
+        return tuple(float(v) for v in region)
     return float(region.x_min), float(region.y_min), float(region.x_max), float(region.y_max)
 
 

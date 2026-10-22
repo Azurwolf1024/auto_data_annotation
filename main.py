@@ -147,6 +147,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="MCP 服务器脚本路径；默认自动定位 mcp_server/crop_zoom_server.py",
     )
+    parser.add_argument(
+        "--zoom-mode",
+        default="model",
+        choices=["model", "threshold", "both"],
+        help=(
+            "放大触发方式：model=仅模型主动请求的 zoom_regions（默认）；"
+            "threshold=仅对低置信候选放大；both=两者都触发"
+        ),
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="把最终标注（框/点/文字框）画回原图，生成 <viz-dir>/<stem>.png 供人工检查",
+    )
+    parser.add_argument(
+        "--viz-dir",
+        default="",
+        help="可视化输出目录；默认 <output-dir>/_viz",
+    )
     return parser
 
 
