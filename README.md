@@ -7,7 +7,8 @@
 - **5 种任务**：`box` 检测框 / `point` 物体中心点 / `ocr` 文字识别 / `caption` 图像描述 / `tag` 多标签
 - **4 种输出**：`json`（每图一个）/ `csv`（整批汇总）/ `yolo`（box、point）/ `coco`（box、point）
 - **结构化保证**：用 Ollama `format` 参数传 JSON Schema 强制输出；解析失败自动重试 2 次（共 3 次），仍失败则跳过并记日志
-- **坐标归一化**：全部坐标统一到 0~1；模型若返回像素值会自动按图片宽高归一化
+- **坐标归一化**：全部坐标统一到 0~1；自动识别模型的三种输出尺度——已归一化（≤1）、
+  VLM 常见的 0~1000 归一化、以及绝对像素值，无需手工换算
 - **point 可训练**：point 导出 YOLO/COCO 时自动把中心点膨胀成小方框（默认 32px），避免零面积框无法训练
 - **断点续跑**：中途中断再跑一次即可继续，已完成的图片不会重复调用模型
 - **二次验证（harness loop）**：`--verify` 开启后，box/point 检测出的每个候选会单独裁切出来再问一次模型「这里真有目标本体吗」，可挡掉 HUD / 文字横幅 / 武器视图等误检，并回贴修正框
@@ -17,8 +18,11 @@
 
 ## 安装
 
+环境要求：Python 3.10+；本地已安装并运行 [Ollama](https://ollama.com)（含任意 vision 模型）。
+Pillow 为可选依赖——不装也能跑（图片尺寸走纯 Python 解析文件头），装了对特殊编码图片更稳。
+
 ```bash
-# 1. 安装依赖
+# 1. 安装依赖（建议用虚拟环境）
 pip install -r requirements.txt
 
 # 2. 确认本地视觉模型（输出中 Capabilities 含 vision 的模型可用）
@@ -29,6 +33,16 @@ ollama show qwen3.5:4b
 ```
 
 > 本机实测可用模型：`qwen3.5:4b`（Capabilities: vision ✓），代码默认即该模型。
+> 不同模型的坐标/JSON 输出习惯略有差异，换模型后建议先跑一遍「快速开始」核对结果。
+
+## 测试
+
+```bash
+# 一条命令跑全部测试（MCP 协议 + harness 集成 + Ollama 客户端修复）
+python -m tests
+```
+
+测试不依赖 Ollama 服务，全部用 mock，可离线运行。详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 快速开始
 
@@ -350,10 +364,18 @@ CSV 列定义：
 auto-annotator/
 ├── requirements.txt
 ├── README.md
+├── CHANGELOG.md            版本变更记录
+├── CONTRIBUTING.md         开发环境与测试约定
+├── LICENSE                 MIT 许可证
 ├── main.py                 薄 CLI 封装
 ├── mcp_server/
 │   ├── __init__.py
 │   └── crop_zoom_server.py 轻量 MCP 服务（裁剪/放大 + 坐标映射，零额外依赖）
+├── tests/
+│   ├── __main__.py         统一测试入口（python -m tests）
+│   ├── test_mcp_zoom.py    MCP 协议层测试
+│   ├── test_harness_zoom.py harness 集成层测试
+│   └── test_ollama_client_fixes.py  Ollama 客户端修复回归测试
 └── src/
     ├── __init__.py         包出口：Config / run / export
     ├── config.py           Config 数据类与校验
@@ -413,7 +435,7 @@ A：该图会被标记 `status="failed"` 并跳过，不影响其他图片。可
 A：YOLO 标签只有 bbox 与 pose 两种表达，`ocr` / `caption` / `tag` 请改用 `--output-format json` 或 `csv`。
 
 **Q：坐标看起来不对**
-A：代码会自动把 >1 的像素坐标按图片宽高归一化，并裁剪到 [0,1]（`zoom_regions` 同样会换算）；若仍异常，说明模型输出的框本身有偏差，可降低 `--confidence` 或换模型。
+A：代码会自动识别三种坐标尺度并统一到 [0,1]：值 ≤1 视为已归一化；大图上 ≤1000 的值视为 VLM 常见的 0~1000 归一化（除以 1000）；其余按绝对像素值除以图片宽高。`zoom_regions` 同样处理。若仍异常，说明模型给的框本身有偏差，可降低 `--confidence` 或换模型。
 
 **Q：开了 `--zoom-on-uncertain` 但 `_zoom/` 是空的**
 A：默认 `--zoom-mode model`，只有模型主动声明 `zoom_regions` 才会放大。想强制对低置信候选放大，改用 `--zoom-mode threshold`（或 `both`）；也可调高 `--zoom-threshold`。
@@ -484,9 +506,8 @@ A：视觉模型推理本身耗时，可用 `--workers 4` 并发（注意显存/
    模型偶尔把对象包成单元素数组 `[{...}]` 或在 JSON 前后夹带文字，
    `parse_content` 现在会拆包数组、截取 JSON 主体。
 
-回归测试：`python -m tests`（原有 10 项）+ `python tests/test_ollama_client_fixes.py`
-（新增 13 项，覆盖上述修复）。
+回归测试：`python -m tests` 一条命令覆盖全部三个套件（含上述修复的 13 项专项测试）。
 
 ## 许可
 
-内部工具，按需修改使用。
+[MIT](LICENSE) — 可自由使用、修改与分发，保留版权声明即可。

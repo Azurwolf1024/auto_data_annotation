@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""一键运行全部测试：MCP 协议层 + harness 集成层。
+"""一键运行全部测试：MCP 协议层 + harness 集成层 + Ollama 客户端修复。
 
 用法（在项目根目录执行）：
     python -m tests
@@ -24,9 +24,10 @@ for _p in (_HERE, _ROOT):
 def main() -> int:
     import test_mcp_zoom as t_mcp
     import test_harness_zoom as t_harness
+    import test_ollama_client_fixes as t_fixes
 
     code = 0
-    for suite in (t_mcp, t_harness):
+    for suite in (t_mcp, t_harness, t_fixes):
         try:
             rc = suite.main()
         except Exception as exc:  # noqa: BLE001 - 某个套件崩溃不应吞掉整体退出码

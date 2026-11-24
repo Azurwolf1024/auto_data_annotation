@@ -126,7 +126,9 @@ def test_parse_array():
     check(d2.get("summary") == "hi", "代码块包裹对象正常解析")
 
 
-if __name__ == "__main__":
+def main() -> int:
+    global PASS, FAIL
+    PASS, FAIL = 0, 0
     for fn in (
         test_detect_scale,
         test_clean_0_1000,
@@ -136,4 +138,8 @@ if __name__ == "__main__":
     ):
         fn()
     print(f"\n==== 修复测试：{PASS}/{PASS + FAIL} 通过 ====")
-    sys.exit(0 if FAIL == 0 else 1)
+    return 0 if FAIL == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
