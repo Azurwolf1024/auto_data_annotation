@@ -87,6 +87,11 @@ class Config:
     # 自动可视化：把最终标注（框/点/文字框）画回原图供人工检查
     visualize: bool = False
     viz_dir: str = ""  # 可视化输出目录，默认 <output_dir>/_viz
+    # Ollama 运行参数（本机实测经验）：
+    # num_ctx=0 表示按图片面积自适应（大图自动扩窗，避免输出被截断）；
+    # max_tokens 是 num_predict 预算，需 >= 结构化输出的 token 量。
+    num_ctx: int = 0
+    max_tokens: int = 2048
 
     # ------------------------------------------------------------------ #
     def validate(self) -> "Config":
@@ -134,6 +139,20 @@ class Config:
             raise ValueError(
                 f"confidence_threshold 必须在 0~1 之间，当前为 {self.confidence_threshold}"
             )
+
+        # num_ctx：0=自适应，>0 需不小于 512；max_tokens 必须为正
+        try:
+            self.num_ctx = int(self.num_ctx or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"num_ctx 必须是整数，当前为 {self.num_ctx!r}")
+        if self.num_ctx < 0:
+            raise ValueError(f"num_ctx 不能为负，当前为 {self.num_ctx}")
+        try:
+            self.max_tokens = int(self.max_tokens or 2048)
+        except (TypeError, ValueError):
+            raise ValueError(f"max_tokens 必须是整数，当前为 {self.max_tokens!r}")
+        if self.max_tokens < 1:
+            raise ValueError(f"max_tokens 必须 >= 1，当前为 {self.max_tokens}")
 
         try:
             self.point_box_size = float(self.point_box_size)
@@ -287,6 +306,8 @@ class Config:
             .lower(),
             visualize=bool(getattr(args, "visualize", False)),
             viz_dir=str(getattr(args, "viz_dir", "") or ""),
+            num_ctx=int(getattr(args, "num_ctx", 0) or 0),
+            max_tokens=int(getattr(args, "max_tokens", 2048) or 2048),
         )
 
     # ------------------------------------------------------------------ #
@@ -311,6 +332,8 @@ class Config:
                 else ""
             )
             + (f" visualize=on dir={self.viz_dir or '<output>/_viz'}" if self.visualize else "")
+            + (f" num_ctx={self.num_ctx}(auto)" if not self.num_ctx else f" num_ctx={self.num_ctx}")
+            + f" max_tokens={self.max_tokens}"
         )
 
 

@@ -40,8 +40,58 @@ def clamp(value: float) -> float:
     return value
 
 
-def _normalize_coord(value: float, size: Optional[int]) -> float:
-    """如果提供了图片宽/高且坐标明显是像素值（>1），则归一化。"""
+def detect_coord_scale(
+    values, image_size: Optional[Tuple[int, int]] = None
+) -> str:
+    """检测一组坐标的数值尺度，返回 unit / norm1000 / pixel。
+
+    背景（本机 qwen3.5:4b 实测）：
+    - prompt 明确要求 0~1，但模型对**大图**（如 2945x1687）稳定输出
+      0~1000 归一化坐标，例如「开始游戏」按钮 [365, 634, 617, 758]；
+      若按像素解释会得到左上角 (0.12, 0.38)，完全错误。
+    - 而对小图（如 1000x800）模型又常输出真正的像素坐标（如 400, 240）。
+    因此不能简单用「>1 就是像素」判断，需要结合图片尺寸区分。
+
+    启发式：
+    - 全部 <=1 → unit（已是归一化）；
+    - 否则若图片最大边 >1200 且所有坐标 <=1000 → norm1000（0~1000 归一化）；
+      理由：在 2945 宽的图上，像素坐标会达到 2000+，模型若输出像素不会只到 758；
+    - 其余 → pixel（按图片宽/高归一化，兼容旧行为与小图测试）。
+    """
+    vals = [abs(float(v)) for v in values if v is not None]
+    if not vals:
+        return "unit"
+    mx = max(vals)
+    if mx <= 1.0:
+        return "unit"
+    if image_size:
+        try:
+            max_side = max(int(image_size[0]), int(image_size[1]))
+        except (TypeError, ValueError, IndexError):
+            max_side = 0
+        if mx <= 1000.0 and max_side > 1200:
+            return "norm1000"
+    return "pixel"
+
+
+def _normalize_coord(
+    value: float, size: Optional[int], scale: str = "auto"
+) -> float:
+    """按指定尺度把坐标归一化到 0~1。
+
+    scale:
+    - unit     : 已经是 0~1，原样返回；
+    - norm1000 : 0~1000 归一化，除以 1000；
+    - pixel    : 像素坐标，除以对应边长 size；
+    - auto     : 旧行为（值>1 且给了 size 就当像素），兼容历史调用。
+    """
+    if scale == "unit":
+        return value
+    if scale == "norm1000":
+        return value / 1000.0
+    if scale == "pixel":
+        return value / float(size) if size and size > 0 else value
+    # auto：保持旧逻辑，避免影响未显式传 scale 的调用方
     if size and size > 0 and value > 1.0:
         return value / float(size)
     return value
@@ -95,6 +145,7 @@ def _clean_box_items(
     targets: List[str],
     threshold: float,
     image_size: Optional[Tuple[int, int]] = None,
+    coord_scale: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     width = image_size[0] if image_size else None
     height = image_size[1] if image_size else None
@@ -109,10 +160,12 @@ def _clean_box_items(
         if confidence < threshold:
             continue
 
-        x_min = _normalize_coord(_to_float(item.get("x_min")), width)
-        y_min = _normalize_coord(_to_float(item.get("y_min")), height)
-        x_max = _normalize_coord(_to_float(item.get("x_max")), width)
-        y_max = _normalize_coord(_to_float(item.get("y_max")), height)
+        raw_coords = [item.get(k) for k in _COORD_FIELDS_BOX]
+        scale = coord_scale or detect_coord_scale(raw_coords, image_size)
+        x_min = _normalize_coord(_to_float(item.get("x_min")), width, scale)
+        y_min = _normalize_coord(_to_float(item.get("y_min")), height, scale)
+        x_max = _normalize_coord(_to_float(item.get("x_max")), width, scale)
+        y_max = _normalize_coord(_to_float(item.get("y_max")), height, scale)
 
         x_min, x_max = _fix_pair(x_min, x_max)
         y_min, y_max = _fix_pair(y_min, y_max)
@@ -144,6 +197,7 @@ def _clean_point_items(
     targets: List[str],
     threshold: float,
     image_size: Optional[Tuple[int, int]] = None,
+    coord_scale: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     width = image_size[0] if image_size else None
     height = image_size[1] if image_size else None
@@ -157,8 +211,9 @@ def _clean_point_items(
         if confidence < threshold:
             continue
 
-        x = clamp(_normalize_coord(_to_float(item.get("x")), width))
-        y = clamp(_normalize_coord(_to_float(item.get("y")), height))
+        scale = coord_scale or detect_coord_scale([item.get("x"), item.get("y")], image_size)
+        x = clamp(_normalize_coord(_to_float(item.get("x")), width, scale))
+        y = clamp(_normalize_coord(_to_float(item.get("y")), height, scale))
 
         cleaned.append(
             {
@@ -174,6 +229,7 @@ def _clean_point_items(
 def _clean_ocr_items(
     raw: Dict[str, Any],
     image_size: Optional[Tuple[int, int]] = None,
+    coord_scale: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     width = image_size[0] if image_size else None
     height = image_size[1] if image_size else None
@@ -187,10 +243,12 @@ def _clean_ocr_items(
         if not text:
             continue
 
-        x_min = _normalize_coord(_to_float(item.get("x_min")), width)
-        y_min = _normalize_coord(_to_float(item.get("y_min")), height)
-        x_max = _normalize_coord(_to_float(item.get("x_max")), width)
-        y_max = _normalize_coord(_to_float(item.get("y_max")), height)
+        raw_coords = [item.get(k) for k in _COORD_FIELDS_BOX]
+        scale = coord_scale or detect_coord_scale(raw_coords, image_size)
+        x_min = _normalize_coord(_to_float(item.get("x_min")), width, scale)
+        y_min = _normalize_coord(_to_float(item.get("y_min")), height, scale)
+        x_max = _normalize_coord(_to_float(item.get("x_max")), width, scale)
+        y_max = _normalize_coord(_to_float(item.get("y_max")), height, scale)
 
         x_min, x_max = _fix_pair(x_min, x_max)
         y_min, y_max = _fix_pair(y_min, y_max)
@@ -249,6 +307,7 @@ def clean(
     targets: List[str] = None,
     confidence_threshold: float = 0.3,
     image_size: Optional[Tuple[int, int]] = None,
+    coord_scale: Optional[str] = None,
 ) -> Dict[str, Any]:
     """清洗模型原始输出。
 
@@ -259,6 +318,8 @@ def clean(
     targets : 候选标签列表
     confidence_threshold : 置信度阈值，低于该值的项被丢弃
     image_size : 可选 (width, height)，用于把模型误输出的像素坐标归一化
+    coord_scale : 可选，显式指定坐标尺度 unit / norm1000 / pixel；
+                  None 表示按 detect_coord_scale 自动判断（推荐）
 
     返回
     ----
@@ -271,13 +332,13 @@ def clean(
     task_type = (task_type or "").strip().lower()
 
     if task_type == "box":
-        return {"objects": _clean_box_items(raw, targets, confidence_threshold, image_size)}
+        return {"objects": _clean_box_items(raw, targets, confidence_threshold, image_size, coord_scale)}
 
     if task_type == "point":
-        return {"points": _clean_point_items(raw, targets, confidence_threshold, image_size)}
+        return {"points": _clean_point_items(raw, targets, confidence_threshold, image_size, coord_scale)}
 
     if task_type == "ocr":
-        return {"blocks": _clean_ocr_items(raw, image_size)}
+        return {"blocks": _clean_ocr_items(raw, image_size, coord_scale)}
 
     if task_type == "caption":
         summary = raw.get("summary", "")
@@ -291,4 +352,4 @@ def clean(
     raise ValueError(f"未知 task_type：{task_type!r}")
 
 
-__all__ = ["clean", "clamp", "MAX_TAGS"]
+__all__ = ["clean", "clamp", "detect_coord_scale", "MAX_TAGS"]

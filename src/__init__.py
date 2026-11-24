@@ -6,7 +6,7 @@ from .schema import SCHEMA_MAP, AnnotationResult
 from .pipeline import run
 from .exporters import export
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Config",

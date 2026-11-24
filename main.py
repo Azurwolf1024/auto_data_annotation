@@ -166,6 +166,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="可视化输出目录；默认 <output-dir>/_viz",
     )
+    # ---- Ollama 运行参数（实测经验：大图需扩上下文，避免输出被截断）----
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        default=0,
+        help=(
+            "Ollama num_ctx；0=按图片面积自适应（大图自动扩到约 8192，推荐）；"
+            ">0 则强制使用指定值"
+        ),
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        help="num_predict 输出预算，默认 2048；文字极多的图可调大",
+    )
     return parser
 
 

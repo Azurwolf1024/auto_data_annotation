@@ -27,6 +27,46 @@ except ImportError as exc:  # pragma: no cover
 MAX_ATTEMPTS = 3  # 首次调用 + 重试 2 次
 RETRY_SLEEP = 1.5  # 每次重试前的等待秒数
 
+# num_ctx 自适应（本机 qwen3.5:4b 实测）：
+#   1024x768 图 -> 约 300~800 图像 token
+#   2945x1687 图 -> 约 4090 图像 token（prompt_eval_count 实测）
+# 模型默认 num_ctx=4096，大图几乎占满上下文，导致生成被截断到 4~6 token
+# 就停下（表现为输出残缺/空）。按像素面积估算图像 token 并留出输出预算，
+# 可彻底避免该问题。系数按约 1200 px/token 估（偏保守取整）。
+PIXELS_PER_IMAGE_TOKEN = 1200
+DEFAULT_NUM_CTX = 4096
+CTX_SAFETY_MARGIN = 512  # 给提示词与结构开销留的余量
+DEFAULT_OUTPUT_BUDGET = 2048  # num_predict：密集 OCR / 多目标输出可能很长，给足预算
+
+
+def estimate_image_tokens(image_path: str) -> int:
+    """按图片像素面积估算视觉 token 数；读不到尺寸时返回 0。"""
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            w, h = img.size
+        return max(1, int((w * h) / PIXELS_PER_IMAGE_TOKEN))
+    except Exception:  # noqa: BLE001 - 无 Pillow 或损坏图片时静默降级
+        return 0
+
+
+def decide_num_ctx(
+    image_path: str,
+    requested: int = 0,
+    output_budget: int = DEFAULT_OUTPUT_BUDGET,
+) -> int:
+    """决定本次调用的 num_ctx。
+
+    requested>0 时尊重用户显式设置；否则 = 图像 token + 输出预算 + 余量，
+    且不低于 DEFAULT_NUM_CTX。这样小图仍用 4096，大图自动扩到 8192 左右。
+    """
+    if requested and int(requested) > 0:
+        return int(requested)
+    img_tokens = estimate_image_tokens(image_path)
+    need = img_tokens + int(output_budget) + CTX_SAFETY_MARGIN
+    return max(DEFAULT_NUM_CTX, need)
+
 
 # --------------------------------------------------------------------------- #
 # JSON Schema 处理
@@ -114,11 +154,24 @@ def _extract_json_object(text: str) -> str:
 
 
 def parse_content(content: str) -> Dict[str, Any]:
-    """把模型返回的文本解析成 dict，失败抛 ValueError。"""
+    """把模型返回的文本解析成 dict，失败抛 ValueError。
+
+    实测兼容点（qwen3.5:4b）：
+    - 有时把对象包成单元素数组 `[{"objects": [...]}]`，这里拆包取第一个 dict；
+    - 偶尔在 JSON 前后夹带说明文字，_extract_json_object 负责截取对象主体。
+    """
     if content is None:
         raise ValueError("模型返回内容为空")
     text = _extract_json_object(_strip_code_fence(content))
     data = json.loads(text)
+    if isinstance(data, list):
+        # 模型偶尔返回数组：取其中第一个 dict 元素
+        for item in data:
+            if isinstance(item, dict):
+                data = item
+                break
+        else:
+            raise ValueError("模型返回的数组中没有 JSON 对象")
     if not isinstance(data, dict):
         raise ValueError(f"模型返回的不是 JSON 对象：{type(data).__name__}")
     return data
@@ -155,13 +208,27 @@ def _call_chat(
     image_path: str,
     schema: Dict[str, Any],
     think: bool,
+    num_ctx: int = 0,
+    num_predict: int = 0,
 ) -> Any:
-    """发起一次 chat 调用；不支持 think 参数的旧版库会自动降级。"""
+    """发起一次 chat 调用；不支持 think 参数的旧版库会自动降级。
+
+    - think=False 时显式关闭思考：结构化标注不需要思考，且实测 qwen3.5:4b
+      开启思考会把 token 浪费在推理上、几乎不给最终答案（甚至输出为空）。
+    - num_ctx>0 时写入 options，避免大图撑爆默认 4096 上下文导致输出被截断。
+    - num_predict>0 时设定输出预算：大图 OCR/密集目标输出很长，不设会被截断成
+      半截 JSON（表现为 "Expecting property name ... line N" 解析错误）。
+    """
+    options: Dict[str, Any] = {"temperature": 0}
+    if num_ctx and num_ctx > 0:
+        options["num_ctx"] = num_ctx
+    if num_predict and num_predict > 0:
+        options["num_predict"] = num_predict
     kwargs = {
         "model": model,
         "messages": [{"role": "user", "content": prompt, "images": [image_path]}],
         "format": schema,
-        "options": {"temperature": 0},
+        "options": options,
     }
     if not think:
         kwargs["think"] = False
@@ -204,9 +271,23 @@ def annotate(
     if own_client:
         client = build_client(getattr(config, "ollama_url", "http://localhost:11434"))
 
+    # num_ctx / num_predict 自适应：
+    # - 大图必须扩上下文窗，否则图像 token 占满 4096 导致输出被截断到几个 token；
+    # - 密集 OCR/多目标输出很长，num_predict 不足会得到半截 JSON 解析失败。
+    max_tokens = int(getattr(config, "max_tokens", DEFAULT_OUTPUT_BUDGET) or DEFAULT_OUTPUT_BUDGET)
+    num_ctx = decide_num_ctx(
+        str(image_path),
+        requested=getattr(config, "num_ctx", 0),
+        output_budget=max_tokens,
+    )
+    num_predict = max_tokens
+
     last_error: Optional[Exception] = None
     for attempt in range(1, max_attempts + 1):
-        think_flag = attempt == 1  # 第一次尝试关闭思考，重试时放开以增加多样性
+        response: Any = None
+        # 结构化标注始终关闭思考。实测 qwen3.5:4b 思考模式下会把全部预算花在
+        # 推理过程、最终 JSON 为空；只有 think=False 才能稳定给出结构化答案。
+        think_flag = False
         try:
             response = _call_chat(
                 client=client,
@@ -215,6 +296,8 @@ def annotate(
                 image_path=str(image_path),
                 schema=schema,
                 think=think_flag,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
             )
             message = getattr(response, "message", None)
             if message is None and isinstance(response, dict):
@@ -228,6 +311,22 @@ def annotate(
             return validated.model_dump()
         except Exception as exc:  # noqa: BLE001 - 任何异常都要重试
             last_error = exc
+            # 若响应携带真实计数，用它们反推下一次的预算（只升不降）：
+            # - prompt_eval_count 修正 num_ctx，比像素估算更准，兜住估算偏小的图；
+            # - eval_count 已顶到 num_predict 说明输出被截断，翻倍输出预算。
+            try:
+                used_prompt = getattr(response, "prompt_eval_count", 0) or 0
+                used_eval = getattr(response, "eval_count", 0) or 0
+                if isinstance(response, dict):
+                    used_prompt = response.get("prompt_eval_count", 0) or 0
+                    used_eval = response.get("eval_count", 0) or 0
+                if used_prompt and int(used_prompt) + num_predict + CTX_SAFETY_MARGIN > num_ctx:
+                    num_ctx = int(used_prompt) + num_predict + CTX_SAFETY_MARGIN
+                if used_eval and int(used_eval) >= num_predict:
+                    num_predict = int(num_predict) * 2
+                    num_ctx = max(num_ctx, int(used_prompt) + num_predict + CTX_SAFETY_MARGIN)
+            except Exception:  # noqa: BLE001
+                pass
             if attempt < max_attempts:
                 time.sleep(RETRY_SLEEP * attempt)
                 continue

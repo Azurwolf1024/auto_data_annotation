@@ -407,10 +407,25 @@ def _normalize_regions(regions, image_size=None) -> List[Dict[str, Any]]:
         except (KeyError, TypeError, ValueError):
             continue
 
-        # 明显超出 0~1 → 判定为像素坐标，按图片尺寸归一化
-        if max(x0, x1, y0, y1) > 1.0 and width and height:
-            x0, x1 = x0 / width, x1 / width
-            y0, y1 = y0 / height, y1 / height
+        # 明显超出 0~1 → 判定为像素坐标或 0~1000 归一化坐标。
+        # 实测 qwen3.5:4b 对大图（如 2945x1687）稳定输出 0~1000 归一化值，
+        # 若误当像素会缩小约 3 倍；这里按与 validator 一致的启发式区分。
+        if max(x0, x1, y0, y1) > 1.0:
+            try:
+                from .validator import detect_coord_scale
+
+                scale = detect_coord_scale([x0, y0, x1, y1], image_size)
+            except Exception:  # noqa: BLE001
+                scale = "auto"
+            if scale == "norm1000":
+                x0, x1 = x0 / 1000.0, x1 / 1000.0
+                y0, y1 = y0 / 1000.0, y1 / 1000.0
+            elif scale == "auto" and width and height:
+                x0, x1 = x0 / width, x1 / width
+                y0, y1 = y0 / height, y1 / height
+            elif scale == "pixel" and width and height:
+                x0, x1 = x0 / width, x1 / width
+                y0, y1 = y0 / height, y1 / height
 
         reg = _norm_region((x0, y0, x1, y1))
         if reg:
